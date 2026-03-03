@@ -27,6 +27,8 @@ export async function startTelegram(
 
   const bot = new Bot(config.telegramToken);
 
+  const configuredChatIds = new Set<number>();
+
   const tgCommands = [
     { command: 'help', description: 'Show commands' },
     { command: 'ui', description: 'Set UI mode (verbose/summary)' },
@@ -49,6 +51,10 @@ export async function startTelegram(
   void bot.api
     .setMyCommands(tgCommands, { scope: { type: 'all_group_chats' } })
     .catch((err) => log.warn('Telegram setMyCommands(group) error', err));
+
+  void bot.api
+    .setMyCommands(tgCommands, { scope: { type: 'all_chat_administrators' } })
+    .catch((err) => log.warn('Telegram setMyCommands(admins) error', err));
 
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data ?? '';
@@ -156,6 +162,13 @@ export async function startTelegram(
         : null;
 
       const userId = String(ctx.from?.id ?? 'unknown');
+
+      if (!configuredChatIds.has(ctx.chat.id)) {
+        configuredChatIds.add(ctx.chat.id);
+        void bot.api
+          .setMyCommands(tgCommands, { scope: { type: 'chat', chat_id: ctx.chat.id } })
+          .catch((err) => log.warn('Telegram setMyCommands(chat) error', err));
+      }
 
       const key: ConversationKey = {
         platform: 'telegram',
