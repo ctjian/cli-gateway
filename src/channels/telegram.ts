@@ -128,7 +128,11 @@ export async function startTelegram(
         userId,
       );
 
-      await router.handleUserMessage(key, text, sink);
+      // Do not await: grammY processes updates sequentially.
+      // Awaiting here deadlocks permission flow (callback_query can't be handled).
+      void router.handleUserMessage(key, text, sink).catch((error) => {
+        log.error('Telegram router handler error', error);
+      });
     } catch (error) {
       log.error('Telegram message handler error', error);
     }
