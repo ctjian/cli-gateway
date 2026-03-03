@@ -69,6 +69,32 @@ export class BindingRuntime {
             await sink.sendText(text);
           }
 
+          if (
+            update?.sessionUpdate === 'tool_call' ||
+            update?.sessionUpdate === 'tool_call_update'
+          ) {
+            const title = String(update?.title ?? update?.toolCallId ?? 'tool_call');
+            const detail =
+              this.currentUiMode === 'verbose'
+                ? renderJson(update, this.config.uiJsonMaxChars)
+                : undefined;
+
+            if (sink.sendUi) {
+              await sink.sendUi({
+                kind: 'tool',
+                mode: this.currentUiMode,
+                title,
+                detail,
+              });
+            } else {
+              await sink.sendText(
+                this.currentUiMode === 'verbose'
+                  ? `\n[tool]\n${title}\n${detail ?? ''}\n`
+                  : `\n[tool] ${title}`,
+              );
+            }
+          }
+
           if (update?.sessionUpdate === 'plan') {
             const detail = renderJson(update, this.config.uiJsonMaxChars);
             if (sink.sendUi) {

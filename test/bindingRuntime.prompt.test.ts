@@ -67,6 +67,19 @@ class FakeRpc implements StdioProcess {
         this.promptRequestId = Number(req.id);
 
         queueMicrotask(() => {
+          // emit a tool call update (UI)
+          this.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: this.sessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                title: 'terminal/create',
+              },
+            },
+          } as any);
+
           // emit a plan update
           this.emit({
             jsonrpc: '2.0',
@@ -269,7 +282,7 @@ test('BindingRuntime prompt emits plan/tool UI and supports interactive permissi
   assert.equal(out.stopReason, 'end');
 
   assert.ok(uiEvents.some((e) => e.kind === 'plan'));
-  assert.ok(uiEvents.some((e) => e.kind === 'tool'));
+  assert.ok(uiEvents.some((e) => e.kind === 'tool' && e.title === 'terminal/create'));
   assert.ok(chunks.join('').includes('done'));
 
   // ensure allow decision granted exactly once

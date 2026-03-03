@@ -27,16 +27,30 @@ export async function startTelegram(
   const bot = new Bot(config.telegramToken);
 
   bot.on('callback_query:data', async (ctx) => {
+    const data = ctx.callbackQuery.data;
+
+    // Always answer callback queries to avoid Telegram client hanging.
+    let answerText: string | null | undefined;
+    let ok = false;
+
     try {
-      const data = ctx.callbackQuery.data;
-      if (!data.startsWith('acpperm:')) return;
+      if (!data.startsWith('acpperm:')) {
+        answerText = 'Unsupported action.';
+        // fallthrough to finally (answerCallbackQuery)
+        return;
+      }
 
       const parts = data.split(':');
       const sessionKey = parts[1] ?? '';
       const requestId = parts[2] ?? '';
       const decision = parts[3] ?? '';
 
-      if (!sessionKey || !requestId || (decision !== 'allow' && decision !== 'deny')) {
+      if (
+        !sessionKey ||
+        !requestId ||
+        (decision !== 'allow' && decision !== 'deny')
+      ) {
+        answerText = 'Invalid action.';
         return;
       }
 
@@ -50,10 +64,8 @@ export async function startTelegram(
         actorUserId,
       });
 
-      await ctx.answerCallbackQuery({
-        text: res.message,
-        show_alert: !res.ok,
-      });
+      answerText = res.message;
+      ok = res.ok;
 
       if (res.ok) {
         const msg = ctx.callbackQuery.message;
@@ -69,6 +81,16 @@ export async function startTelegram(
       }
     } catch (error) {
       log.error('Telegram callback handler error', error);
+      answerText = 'Internal error.';
+    } finally {
+      try {
+        await ctx.answerCallbackQuery({
+          text: answerText ?? 'Error',
+          show_alert: !ok,
+        });
+      } catch (error) {
+        log.error('Telegram answerCallbackQuery error', error);
+      }
     }
   });
 
@@ -107,7 +129,11 @@ export async function startTelegram(
     log.error('Telegram bot error', err);
   });
 
-  await bot.start();
+  void bot.start().catch((err) => {
+    log.error('Telegram bot start error', err);
+  });
+
+  log.info('Telegram bot started');
 
   return {
     createSink: (chatId, threadId, userId) =>
