@@ -154,6 +154,12 @@ export async function startTelegram(
       const text = ctx.message.text;
       if (!text?.trim()) return;
 
+      log.info('telegram inbound message', {
+        chatId: ctx.chat.id,
+        fromId: ctx.from?.id,
+        text: text.slice(0, 120),
+      });
+
       // Emoji reaction to acknowledge receipt.
       void setMessageReaction(config.telegramToken, {
         chatId: ctx.chat.id,
@@ -249,23 +255,33 @@ export async function startTelegram(
     log.error('Telegram bot error', err);
   });
 
-  // Ensure webhook is disabled and optionally clear backlog.
-  void bot.api
-    .deleteWebhook({ drop_pending_updates: true })
-    .catch((err) => log.warn('Telegram deleteWebhook error', err));
+  async function sleep(ms: number): Promise<void> {
+    await new Promise((r) => setTimeout(r, ms));
+  }
 
-  void bot
-    .start({
-      allowed_updates: ['message', 'callback_query'],
-    })
-    .catch((err) => {
-      log.error('Telegram bot start error', err);
-    });
+  // Long polling loop: avoids permanent outage on 409 conflicts.
+  void (async () => {
+    for (;;) {
+      try {
+        await bot.api.deleteWebhook({ drop_pending_updates: true });
 
-  log.info('Telegram bot started (long polling)', {
-    allowedUpdates: ['message', 'callback_query'],
-    dropPendingUpdates: true,
-  });
+        log.info('Telegram long polling start', {
+          allowedUpdates: ['message', 'callback_query'],
+          dropPendingUpdates: true,
+        });
+
+        await bot.start({
+          allowed_updates: ['message', 'callback_query'],
+        });
+
+        log.warn('Telegram bot stopped; restarting in 2s');
+      } catch (err) {
+        log.error('Telegram bot start/poll error; restarting in 2s', err);
+      }
+
+      await sleep(2000);
+    }
+  })();
 
   return {
     createSink: (chatId, threadId, userId) =>
