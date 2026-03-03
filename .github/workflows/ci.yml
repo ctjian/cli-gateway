@@ -35,5 +35,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Coverage
+      - name: Test
+        run: npm test
+
+      - name: Coverage (gated)
+        if: matrix.node == 22
         run: npm run coverage
