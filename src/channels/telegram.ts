@@ -1,4 +1,4 @@
-import { Bot } from 'grammy';
+import { Bot, type Api } from 'grammy';
 
 import type { GatewayRouter, OutboundSink } from '../gateway/router.js';
 import type { AppConfig } from '../config.js';
@@ -6,7 +6,6 @@ import { log } from '../logging.js';
 import type { ConversationKey } from '../gateway/sessionStore.js';
 import { createTelegramSink } from './telegramSink.js';
 import { setChatMenuButton, setMessageReaction } from './telegramApi.js';
-import { setMessageReaction } from './telegramApi.js';
 
 export type TelegramController = {
   createSink: (
@@ -16,7 +15,6 @@ export type TelegramController = {
   ) => OutboundSink & { flush: () => Promise<void> };
 };
 
-/* c8 ignore start */
 export async function startTelegram(
   router: GatewayRouter,
   config: AppConfig,
@@ -40,12 +38,7 @@ export async function startTelegram(
     { command: 'replay', description: 'Replay a run output' },
   ];
 
-  // Force the Telegram UI to show the command menu button.
-  void setChatMenuButton(config.telegramToken, {}, fetch).catch((err) =>
-    log.warn('Telegram setChatMenuButton(default) error', err),
-  );
-
-  // Set commands for default + private + group scopes.
+  // Best-effort: register commands in common scopes.
   void bot.api
     .setMyCommands(tgCommands)
     .catch((err) => log.warn('Telegram setMyCommands(default) error', err));
@@ -62,150 +55,249 @@ export async function startTelegram(
     .setMyCommands(tgCommands, { scope: { type: 'all_chat_administrators' } })
     .catch((err) => log.warn('Telegram setMyCommands(admins) error', err));
 
-  bot.on('callback_query:data', async (ctx) => {
-    const data = ctx.callbackQuery.data ?? '';
+  // Force Telegram UI to show the command menu button.
+  void setChatMenuButton(config.telegramToken, {}, fetch).catch((err) =>
+    log.warn('Telegram setChatMenuButton(default) error', err),
+  );
 
-    // Always answer quickly so the Telegram client doesn't hang.
+  // Ensure webhook is disabled for long polling.
+  void bot.api
+    .deleteWebhook({ drop_pending_updates: false })
+    .catch((err) => log.warn('Telegram deleteWebhook error', err));
+
+  void startPolling({
+    botApi: bot.api,
+    router,
+    config,
+    configuredChatIds,
+    tgCommands,
+  });
+
+  log.info('Telegram adapter started (custom long polling)');
+
+  return {
+    createSink: (chatId, threadId, userId) =>
+      createTelegramSink(
+        bot,
+        Number(chatId),
+        threadId ? Number(threadId) : null,
+        userId,
+      ),
+  };
+}
+
+async function startPolling(params: {
+  botApi: Api;
+  router: GatewayRouter;
+  config: AppConfig;
+  configuredChatIds: Set<number>;
+  tgCommands: Array<{ command: string; description: string }>;
+}): Promise<void> {
+  const allowedUpdates = ['message', 'callback_query'] as const;
+  let offset = 0;
+
+  for (;;) {
     try {
-      await ctx.answerCallbackQuery({ text: 'Processing...', show_alert: false });
-    } catch {
-      // ignore
-    }
-
-    try {
-      if (!data.startsWith('acpperm:')) return;
-
-      const parts = data.split(':');
-      const sessionKey = parts[1] ?? '';
-      const requestId = parts[2] ?? '';
-      const decision = parts[3] ?? '';
-
-      if (
-        !sessionKey ||
-        !requestId ||
-        (decision !== 'allow' && decision !== 'deny')
-      ) {
-        return;
-      }
-
-      const actorUserId = String(ctx.from?.id ?? '');
-
-      log.info('telegram permission click', {
-        actorUserId,
-        sessionKey,
-        requestId,
-        decision,
+      const updates = await params.botApi.getUpdates({
+        offset,
+        timeout: 30,
+        allowed_updates: allowedUpdates as any,
       });
 
-      const res = await router.handlePermissionUi({
-        platform: 'telegram',
-        sessionKey,
-        requestId,
-        decision,
-        actorUserId,
-      });
+      for (const upd of updates) {
+        offset = Math.max(offset, upd.update_id + 1);
 
-      log.info('telegram permission result', {
-        ok: res.ok,
-        message: res.message,
-      });
+        if (upd.message?.text) {
+          void handleTextMessage({
+            router: params.router,
+            config: params.config,
+            botApi: params.botApi,
+            configuredChatIds: params.configuredChatIds,
+            tgCommands: params.tgCommands,
+            message: upd.message as any,
+          });
+          continue;
+        }
 
-      if (res.ok) {
-        const msg = ctx.callbackQuery.message;
-        if (msg) {
-          try {
-            await bot.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, {
-              reply_markup: { inline_keyboard: [] },
-            });
-          } catch {
-            // ignore if message is not editable
-          }
-
-          // Emoji reaction as a quick confirmation.
-          const emoji = decision === 'allow' ? '👍' : '👎';
-          void setMessageReaction(config.telegramToken, {
-            chatId: msg.chat.id,
-            messageId: msg.message_id,
-            emoji,
-          }).catch(() => {
-            // ignore
+        if (upd.callback_query?.data) {
+          void handleCallbackQuery({
+            router: params.router,
+            config: params.config,
+            botApi: params.botApi,
+            callback: upd.callback_query as any,
           });
         }
       }
+    } catch (err: any) {
+      log.error('Telegram getUpdates error; retrying in 2s', err);
+      await sleep(2000);
+    }
+  }
+}
 
-      // Post a visible confirmation message since callback toasts can be flaky.
+async function handleTextMessage(params: {
+  router: GatewayRouter;
+  config: AppConfig;
+  botApi: Api;
+  configuredChatIds: Set<number>;
+  tgCommands: Array<{ command: string; description: string }>;
+  message: any;
+}): Promise<void> {
+  const text = String(params.message.text ?? '').trim();
+  if (!text) return;
+
+  const chatId = Number(params.message.chat?.id);
+  const threadId = params.message.message_thread_id
+    ? Number(params.message.message_thread_id)
+    : null;
+
+  const fromId = String(params.message.from?.id ?? 'unknown');
+
+  log.info('telegram inbound message', {
+    chatId,
+    fromId,
+    text: text.slice(0, 120),
+  });
+
+  // Ensure commands are visible in this chat.
+  if (!params.configuredChatIds.has(chatId)) {
+    params.configuredChatIds.add(chatId);
+
+    void params.botApi
+      .setMyCommands(params.tgCommands, {
+        scope: { type: 'chat', chat_id: chatId },
+      })
+      .catch((err) => log.warn('Telegram setMyCommands(chat) error', err));
+
+    void setChatMenuButton(params.config.telegramToken!, { chatId }, fetch).catch(
+      (err) => log.warn('Telegram setChatMenuButton(chat) error', err),
+    );
+  }
+
+  const key: ConversationKey = {
+    platform: 'telegram',
+    chatId: String(chatId),
+    threadId: threadId ? String(threadId) : null,
+    userId: fromId,
+  };
+
+  // /start should show help, not fall through to the agent.
+  const normalizedText = text.startsWith('/start') ? '/help' : text;
+
+  const isCommandMessage = normalizedText.startsWith('/');
+  const sink = isCommandMessage
+    ? createTelegramCommandSink(params.botApi, { chatId, threadId })
+    : createTelegramSink(params.botApi as any, chatId, threadId, fromId);
+
+  // Emoji reaction: acknowledge that we're processing.
+  void setMessageReaction(
+    params.config.telegramToken!,
+    {
+      chatId,
+      messageId: Number(params.message.message_id),
+      emoji: '🤔',
+      isBig: false,
+    },
+    fetch,
+  ).catch(() => {
+    // ignore
+  });
+
+  const p = params.router.handleUserMessage(key, normalizedText, sink);
+
+  void p
+    .then(async () => {
+      await setMessageReaction(
+        params.config.telegramToken!,
+        {
+          chatId,
+          messageId: Number(params.message.message_id),
+          emoji: '🕊',
+          isBig: false,
+        },
+        fetch,
+      );
+    })
+    .catch(async (error) => {
+      log.error('Telegram router handler error', error);
       try {
-        await ctx.reply(res.message);
-      } catch (error) {
-        log.error('Telegram permission reply error', error);
-      }
-    } catch (error) {
-      log.error('Telegram callback handler error', error);
-      try {
-        await ctx.reply('Internal error.');
+        await setMessageReaction(
+          params.config.telegramToken!,
+          {
+            chatId,
+            messageId: Number(params.message.message_id),
+            emoji: '😢',
+            isBig: false,
+          },
+          fetch,
+        );
       } catch {
         // ignore
       }
+    });
+}
+
+async function handleCallbackQuery(params: {
+  router: GatewayRouter;
+  config: AppConfig;
+  botApi: Api;
+  callback: any;
+}): Promise<void> {
+  const data = String(params.callback.data ?? '');
+
+  // Always answer quickly so the Telegram client doesn't hang.
+  try {
+    await params.botApi.answerCallbackQuery(params.callback.id, {
+      text: 'Processing...',
+      show_alert: false,
+    });
+  } catch {
+    // ignore
+  }
+
+  try {
+    if (!data.startsWith('acpperm:')) return;
+
+    const parts = data.split(':');
+    const sessionKey = parts[1] ?? '';
+    const requestId = parts[2] ?? '';
+    const decision = parts[3] ?? '';
+
+    if (!sessionKey || !requestId || (decision !== 'allow' && decision !== 'deny')) {
+      return;
     }
-  });
 
-  bot.on('message:text', async (ctx) => {
-    try {
-      const text = ctx.message.text;
-      if (!text?.trim()) return;
+    const actorUserId = String(params.callback.from?.id ?? '');
 
-      log.info('telegram inbound message', {
-        chatId: ctx.chat.id,
-        fromId: ctx.from?.id,
-        text: text.slice(0, 120),
-      });
+    log.info('telegram permission click', {
+      actorUserId,
+      sessionKey,
+      requestId,
+      decision,
+    });
 
-      // Emoji reaction to acknowledge receipt.
-      void setMessageReaction(config.telegramToken, {
-        chatId: ctx.chat.id,
-        messageId: ctx.message.message_id,
-        emoji: '👀',
-      }).catch(() => {
-        // ignore
-      });
+    const res = await params.router.handlePermissionUi({
+      platform: 'telegram',
+      sessionKey,
+      requestId,
+      decision,
+      actorUserId,
+    });
 
-      const threadId = ctx.message.message_thread_id
-        ? String(ctx.message.message_thread_id)
-        : null;
+    log.info('telegram permission result', {
+      ok: res.ok,
+      message: res.message,
+    });
 
-      const userId = String(ctx.from?.id ?? 'unknown');
-
-      if (!configuredChatIds.has(ctx.chat.id)) {
-        configuredChatIds.add(ctx.chat.id);
-        void bot.api
-          .setMyCommands(tgCommands, { scope: { type: 'chat', chat_id: ctx.chat.id } })
-          .catch((err) => log.warn('Telegram setMyCommands(chat) error', err));
-      }
-
-      const key: ConversationKey = {
-        platform: 'telegram',
-        chatId: String(ctx.chat.id),
-        threadId,
-        userId,
-      };
-
-      const sink = createTelegramSink(
-        bot,
-        config.telegramToken,
-        ctx.chat.id,
-        threadId ? Number(threadId) : null,
-        userId,
-      );
-
-      // Do not await: grammY processes updates sequentially.
-      // Awaiting here deadlocks permission flow (callback_query can't be handled).
-      // Emoji reaction: acknowledge that we're processing.
+    const msg = params.callback.message;
+    if (msg) {
+      const emoji = decision === 'allow' ? '👍' : '👎';
       void setMessageReaction(
-        config.telegramToken,
+        params.config.telegramToken!,
         {
-          chatId: ctx.chat.id,
-          messageId: ctx.message.message_id,
-          emoji: '🤔',
+          chatId: Number(msg.chat.id),
+          messageId: Number(msg.message_id),
+          emoji,
           isBig: false,
         },
         fetch,
@@ -213,77 +305,57 @@ export async function startTelegram(
         // ignore
       });
 
-      const p = router.handleUserMessage(key, text, sink);
+      if (res.ok) {
+        try {
+          await params.botApi.editMessageReplyMarkup(Number(msg.chat.id), Number(msg.message_id), {
+            reply_markup: { inline_keyboard: [] },
+          } as any);
+        } catch {
+          // ignore
+        }
+      }
 
-      // Emoji reaction: final status.
-      void p
-        .then(async () => {
-          await setMessageReaction(
-            config.telegramToken,
-            {
-              chatId: ctx.chat.id,
-              messageId: ctx.message.message_id,
-              emoji: '🕊',
-              isBig: false,
-            },
-            fetch,
-          );
-        })
-        .catch(async (error) => {
-          log.error('Telegram router handler error', error);
-          try {
-            await setMessageReaction(
-              config.telegramToken,
-              {
-                chatId: ctx.chat.id,
-                messageId: ctx.message.message_id,
-                emoji: '😢',
-                isBig: false,
-              },
-              fetch,
-            );
-          } catch {
-            // ignore
-          }
+      try {
+        await params.botApi.sendMessage(Number(msg.chat.id), res.message, {
+          message_thread_id: msg.message_thread_id ?? undefined,
         });
-    } catch (error) {
-      log.error('Telegram message handler error', error);
+      } catch (error) {
+        log.error('Telegram permission reply error', error);
+      }
     }
-  });
-
-  bot.catch((err) => {
-    log.error('Telegram bot error', err);
-  });
-
-  // Ensure webhook is disabled for long polling.
-  void bot.api
-    .deleteWebhook({ drop_pending_updates: false })
-    .catch((err) => log.warn('Telegram deleteWebhook error', err));
-
-  log.info('Telegram long polling start', {
-    allowedUpdates: ['message', 'callback_query'],
-    dropPendingUpdates: false,
-  });
-
-  try {
-    // grammY processes updates sequentially.
-    // Do not await this call.
-    bot.start({
-      allowed_updates: ['message', 'callback_query'],
-    });
-  } catch (err) {
-    log.error('Telegram bot start error', err);
+  } catch (error) {
+    log.error('Telegram callback handler error', error);
   }
+}
+
+function createTelegramCommandSink(
+  botApi: Api,
+  params: { chatId: number; threadId: number | null },
+): OutboundSink & { flush: () => Promise<void> } {
+  let text = '';
 
   return {
-    createSink: (chatId, threadId, userId) =>
-      createTelegramSink(
-        bot,
-        config.telegramToken,
-        Number(chatId),
-        threadId ? Number(threadId) : null,
-        userId,
-      ),
+    sendText: async (delta: string) => {
+      text += delta;
+    },
+    flush: async () => {
+      const out = text.trim();
+      text = '';
+      if (!out) return;
+      await botApi.sendMessage(params.chatId, out, {
+        message_thread_id: params.threadId ?? undefined,
+      });
+    },
+    sendUi: async (event) => {
+      const header = `[${event.kind}] ${event.title}`;
+      const body = event.detail && event.mode === 'verbose' ? `\n\n${event.detail}` : '';
+      await botApi.sendMessage(params.chatId, `${header}${body}`, {
+        message_thread_id: params.threadId ?? undefined,
+      });
+    },
   };
 }
-/* c8 ignore stop */
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
