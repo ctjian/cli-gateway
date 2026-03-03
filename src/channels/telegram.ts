@@ -27,17 +27,28 @@ export async function startTelegram(
 
   const bot = new Bot(config.telegramToken);
 
+  const tgCommands = [
+    { command: 'help', description: 'Show commands' },
+    { command: 'ui', description: 'Set UI mode (verbose/summary)' },
+    { command: 'workspace', description: 'Show/set workspace' },
+    { command: 'cron', description: 'Manage scheduler jobs' },
+    { command: 'new', description: 'Reset conversation session' },
+    { command: 'last', description: 'Show last run output' },
+    { command: 'replay', description: 'Replay a run output' },
+  ];
+
+  // Set commands for default + private + group scopes.
   void bot.api
-    .setMyCommands([
-      { command: 'help', description: 'Show commands' },
-      { command: 'ui', description: 'Set UI mode (verbose/summary)' },
-      { command: 'workspace', description: 'Show/set workspace' },
-      { command: 'cron', description: 'Manage scheduler jobs' },
-      { command: 'new', description: 'Reset conversation session' },
-      { command: 'last', description: 'Show last run output' },
-      { command: 'replay', description: 'Replay a run output' },
-    ])
-    .catch((err) => log.warn('Telegram setMyCommands error', err));
+    .setMyCommands(tgCommands)
+    .catch((err) => log.warn('Telegram setMyCommands(default) error', err));
+
+  void bot.api
+    .setMyCommands(tgCommands, { scope: { type: 'all_private_chats' } })
+    .catch((err) => log.warn('Telegram setMyCommands(private) error', err));
+
+  void bot.api
+    .setMyCommands(tgCommands, { scope: { type: 'all_group_chats' } })
+    .catch((err) => log.warn('Telegram setMyCommands(group) error', err));
 
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data ?? '';
