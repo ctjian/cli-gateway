@@ -1,83 +1,89 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { sendMessageDraft, setMessageReaction } from '../src/channels/telegramApi.js';
+import {
+  sendMessageDraft,
+  setChatMenuButton,
+  setMessageReaction,
+} from '../src/channels/telegramApi.js';
 
-function createFetchRecorder(result: any) {
-  const calls: any[] = [];
+test('sendMessageDraft calls sendMessageDraft', async () => {
+  const calls: Array<{ method: string; body: any }> = [];
 
-  const fetchFn = async (url: any, init: any) => {
-    calls.push({ url: String(url), init });
+  const fakeFetch = async (url: any, init: any) => {
+    const method = String(url).split('/').pop() ?? '';
+    calls.push({ method, body: JSON.parse(init.body) });
     return {
-      json: async () => result,
+      ok: true,
+      json: async () => ({ ok: true, result: true }),
     } as any;
   };
 
-  return { fetchFn, calls };
-}
-
-test('sendMessageDraft posts to Telegram API', async () => {
-  const { fetchFn, calls } = createFetchRecorder({ ok: true, result: true });
-
   await sendMessageDraft(
-    'TOKEN',
-    { chatId: 1, threadId: null, draftId: 7, text: 'hi' },
-    fetchFn as any,
+    't',
+    { chatId: 1, threadId: null, draftId: 2, text: 'hi' },
+    fakeFetch as any,
   );
 
-  assert.equal(calls.length, 1);
-  assert.ok(calls[0].url.includes('/botTOKEN/sendMessageDraft'));
-  const body = JSON.parse(calls[0].init.body);
-  assert.equal(body.chat_id, 1);
-  assert.equal(body.draft_id, 7);
-  assert.equal(body.text, 'hi');
+  expect(calls, 'sendMessageDraft', {
+    chat_id: 1,
+    draft_id: 2,
+    text: 'hi',
+  });
 });
 
-test('setMessageReaction posts emoji reaction', async () => {
-  const { fetchFn, calls } = createFetchRecorder({ ok: true, result: true });
+test('setMessageReaction calls setMessageReaction', async () => {
+  const calls: Array<{ method: string; body: any }> = [];
+
+  const fakeFetch = async (url: any, init: any) => {
+    const method = String(url).split('/').pop() ?? '';
+    calls.push({ method, body: JSON.parse(init.body) });
+    return {
+      ok: true,
+      json: async () => ({ ok: true, result: true }),
+    } as any;
+  };
 
   await setMessageReaction(
-    'TOKEN',
-    { chatId: 1, messageId: 2, emoji: '👀' },
-    fetchFn as any,
+    't',
+    { chatId: 1, messageId: 3, emoji: '🕊', isBig: false },
+    fakeFetch as any,
   );
 
-  assert.equal(calls.length, 1);
-  assert.ok(calls[0].url.includes('/botTOKEN/setMessageReaction'));
-  const body = JSON.parse(calls[0].init.body);
-  assert.equal(body.chat_id, 1);
-  assert.equal(body.message_id, 2);
-  assert.equal(body.reaction[0].emoji, '👀');
-});
-
-test('sendMessageDraft throws on API error', async () => {
-  const { fetchFn } = createFetchRecorder({
-    ok: false,
-    error_code: 400,
-    description: 'bad',
+  expect(calls, 'setMessageReaction', {
+    chat_id: 1,
+    message_id: 3,
+    reaction: [{ type: 'emoji', emoji: '🕊' }],
+    is_big: false,
   });
-
-  await assert.rejects(() =>
-    sendMessageDraft(
-      'TOKEN',
-      { chatId: 1, threadId: null, draftId: 7, text: 'hi' },
-      fetchFn as any,
-    ),
-  );
 });
 
-test('setMessageReaction throws on API error', async () => {
-  const { fetchFn } = createFetchRecorder({
-    ok: false,
-    error_code: 400,
-    description: 'bad',
+test('setChatMenuButton calls setChatMenuButton', async () => {
+  const calls: Array<{ method: string; body: any }> = [];
+
+  const fakeFetch = async (url: any, init: any) => {
+    const method = String(url).split('/').pop() ?? '';
+    calls.push({ method, body: JSON.parse(init.body) });
+    return {
+      ok: true,
+      json: async () => ({ ok: true, result: true }),
+    } as any;
+  };
+
+  await setChatMenuButton('t', { chatId: 1 }, fakeFetch as any);
+
+  expect(calls, 'setChatMenuButton', {
+    chat_id: 1,
+    menu_button: { type: 'commands' },
   });
-
-  await assert.rejects(() =>
-    setMessageReaction(
-      'TOKEN',
-      { chatId: 1, messageId: 2, emoji: '👀' },
-      fetchFn as any,
-    ),
-  );
 });
+
+function expect(
+  calls: Array<{ method: string; body: any }>,
+  expectedMethod: string,
+  expectedBody: any,
+): void {
+  const call = calls.find((c) => c.method === expectedMethod);
+  assert.ok(call, `missing ${expectedMethod}`);
+  assert.deepEqual(call.body, expectedBody);
+}

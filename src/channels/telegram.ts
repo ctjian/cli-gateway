@@ -5,6 +5,7 @@ import type { AppConfig } from '../config.js';
 import { log } from '../logging.js';
 import type { ConversationKey } from '../gateway/sessionStore.js';
 import { createTelegramSink } from './telegramSink.js';
+import { setChatMenuButton, setMessageReaction } from './telegramApi.js';
 import { setMessageReaction } from './telegramApi.js';
 
 export type TelegramController = {
@@ -38,6 +39,11 @@ export async function startTelegram(
     { command: 'last', description: 'Show last run output' },
     { command: 'replay', description: 'Replay a run output' },
   ];
+
+  // Force the Telegram UI to show the command menu button.
+  void setChatMenuButton(config.telegramToken, {}, fetch).catch((err) =>
+    log.warn('Telegram setChatMenuButton(default) error', err),
+  );
 
   // Set commands for default + private + group scopes.
   void bot.api
