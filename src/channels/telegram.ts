@@ -26,35 +26,36 @@ export async function startTelegram(
 
   const bot = new Bot(config.telegramToken);
 
-  bot.on('callback_query:data', async (ctx) => {
-    const data = ctx.callbackQuery.data;
+  bot.on('callback_query', async (ctx) => {
+    const data = ctx.callbackQuery.data ?? '';
 
-    // Always answer callback queries to avoid Telegram client hanging.
-    let answerText: string | null | undefined;
-    let ok = false;
+    // Always answer quickly so the Telegram client doesn't hang.
+    try {
+      await ctx.answerCallbackQuery({ text: 'Processing...', show_alert: false });
+    } catch {
+      // ignore
+    }
 
     try {
-      if (!data.startsWith('acpperm:')) {
-        answerText = 'Unsupported action.';
-        // fallthrough to finally (answerCallbackQuery)
-        return;
-      }
+      if (!data.startsWith('acpperm:')) return;
 
       const parts = data.split(':');
       const sessionKey = parts[1] ?? '';
       const requestId = parts[2] ?? '';
       const decision = parts[3] ?? '';
 
-      if (
-        !sessionKey ||
-        !requestId ||
-        (decision !== 'allow' && decision !== 'deny')
-      ) {
-        answerText = 'Invalid action.';
+      if (!sessionKey || !requestId || (decision !== 'allow' && decision !== 'deny')) {
         return;
       }
 
       const actorUserId = String(ctx.from?.id ?? '');
+
+      log.info('telegram permission click', {
+        actorUserId,
+        sessionKey,
+        requestId,
+        decision,
+      });
 
       const res = await router.handlePermissionUi({
         platform: 'telegram',
@@ -64,8 +65,10 @@ export async function startTelegram(
         actorUserId,
       });
 
-      answerText = res.message;
-      ok = res.ok;
+      log.info('telegram permission result', {
+        ok: res.ok,
+        message: res.message,
+      });
 
       if (res.ok) {
         const msg = ctx.callbackQuery.message;
@@ -79,17 +82,19 @@ export async function startTelegram(
           }
         }
       }
+
+      // Post a visible confirmation message since callback toasts can be flaky.
+      try {
+        await ctx.reply(res.message);
+      } catch (error) {
+        log.error('Telegram permission reply error', error);
+      }
     } catch (error) {
       log.error('Telegram callback handler error', error);
-      answerText = 'Internal error.';
-    } finally {
       try {
-        await ctx.answerCallbackQuery({
-          text: answerText ?? 'Error',
-          show_alert: !ok,
-        });
-      } catch (error) {
-        log.error('Telegram answerCallbackQuery error', error);
+        await ctx.reply('Internal error.');
+      } catch {
+        // ignore
       }
     }
   });
