@@ -1,5 +1,8 @@
 import path from 'node:path';
 
+import { acquireProcessLock } from './runtime/lock.js';
+import { resolveGatewayHomeDir } from './config.js';
+
 import { loadConfig } from './config.js';
 import { log } from './logging.js';
 import { openDb } from './db/db.js';
@@ -11,6 +14,23 @@ import { startFeishu, type FeishuController } from './channels/feishu.js';
 import { startScheduler } from './scheduler/scheduler.js';
 
 async function main(): Promise<void> {
+  const gatewayHome = resolveGatewayHomeDir();
+  const lock = acquireProcessLock(path.join(gatewayHome, 'gateway.lock'));
+
+  const cleanup = () => {
+    lock.release();
+  };
+
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    cleanup();
+    process.exit(0);
+  });
+
   const config = loadConfig();
 
   const db = openDb(config.dbPath);
