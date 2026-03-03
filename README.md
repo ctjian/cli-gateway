@@ -99,6 +99,11 @@ Feishu currently runs in webhook event-subscription mode:
 Telegram note:
 - Chat-scoped command menu is synced best-effort from `cli-inline` commands. Commands with `-` are mapped to `_` in Telegram UI.
 
+Discord note:
+- Built-in commands are available as slash commands (`/help`, `/ui`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/cron`).
+- Slash commands are synced at startup (global + per-guild best-effort). Global command propagation may take time on Discord side.
+- ACP `cli-inline` dynamic commands are not yet exposed as Discord slash commands.
+
 ## Security model (default)
 
 - File system and terminal tool calls are restricted to the active workspace root (per conversation; see `/workspace`).

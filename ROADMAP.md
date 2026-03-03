@@ -34,6 +34,7 @@ This document lists current gaps (vs a "production gateway") and the planned dir
 - Context replay (DB-backed) for fresh ACP sessions.
 - Delivery checkpoints table + `/replay` command (best-effort).
 - Interactive permission buttons on Discord/Telegram (Allow/Deny).
+- Discord built-in slash command registration + handling (`/help`, `/ui`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/cron`).
 - Feishu inbound webhook + outbound send (MVP).
 - First-run interactive config wizard (TTY) + lock directory bootstrap.
 

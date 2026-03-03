@@ -2,6 +2,7 @@ import {
   Client,
   GatewayIntentBits,
   Partials,
+  type ChatInputCommandInteraction,
   type TextBasedChannel,
 } from 'discord.js';
 
@@ -13,6 +14,10 @@ import {
   type ConversationKey,
 } from '../gateway/sessionStore.js';
 import { createDiscordSink } from './discordSink.js';
+import {
+  buildDiscordSlashCommands,
+  mapDiscordSlashToRouterCommand,
+} from './discordCommands.js';
 
 export type DiscordController = {
   createSink: (
@@ -41,12 +46,41 @@ export async function startDiscord(
     partials: [Partials.Channel],
   });
 
+  const slashCommands = buildDiscordSlashCommands();
+
   client.on('ready', () => {
     log.info('Discord connected');
+    void syncDiscordSlashCommands(client, slashCommands);
+  });
+
+  client.on('guildCreate', (guild) => {
+    void guild.commands
+      .set(slashCommands)
+      .then(() => {
+        log.info('Discord slash commands synced for new guild', {
+          guildId: guild.id,
+          count: slashCommands.length,
+        });
+      })
+      .catch((error) => {
+        log.warn('Discord guild slash command sync error', {
+          guildId: guild.id,
+          error,
+        });
+      });
   });
 
   client.on('interactionCreate', async (interaction) => {
     try {
+      if (interaction.isChatInputCommand()) {
+        await handleSlashCommand({
+          interaction,
+          router,
+          config,
+        });
+        return;
+      }
+
       if (!interaction.isButton()) return;
 
       const id = interaction.customId;
@@ -129,3 +163,165 @@ export async function startDiscord(
   };
 }
 /* c8 ignore stop */
+
+async function syncDiscordSlashCommands(
+  client: Client,
+  slashCommands: ReturnType<typeof buildDiscordSlashCommands>,
+): Promise<void> {
+  try {
+    if (!client.application) return;
+
+    await client.application.commands.set(slashCommands);
+    log.info('Discord global slash commands synced', {
+      count: slashCommands.length,
+    });
+  } catch (error) {
+    log.warn('Discord global slash command sync error', error);
+  }
+
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      await guild.commands.set(slashCommands);
+      log.info('Discord guild slash commands synced', {
+        guildId: guild.id,
+        count: slashCommands.length,
+      });
+    } catch (error) {
+      log.warn('Discord guild slash command sync error', {
+        guildId: guild.id,
+        error,
+      });
+    }
+  }
+}
+
+async function handleSlashCommand(params: {
+  interaction: ChatInputCommandInteraction;
+  router: GatewayRouter;
+  config: AppConfig;
+}): Promise<void> {
+  const { interaction, router, config } = params;
+
+  if (!interaction.channelId) {
+    await interaction.reply({
+      content: 'This command must be used in a channel.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (
+    config.discordAllowChannelId &&
+    interaction.channelId !== config.discordAllowChannelId
+  ) {
+    await interaction.reply({
+      content: 'This channel is not allowed by gateway config.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const text = mapDiscordSlashToRouterCommand(interaction);
+  if (!text) {
+    await interaction.reply({
+      content: `Unknown command: /${interaction.commandName}`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const key: ConversationKey = {
+    platform: 'discord',
+    chatId: interaction.channelId,
+    threadId: null,
+    userId: interaction.user.id,
+    scopeUserId: interaction.guildId === null ? null : SHARED_CHAT_SCOPE_USER_ID,
+  };
+
+  const sink = createDiscordInteractionSink(interaction);
+
+  await interaction.deferReply();
+  try {
+    await router.handleUserMessage(key, text, sink);
+    if (!sink.hasResponded()) {
+      await interaction.editReply({ content: 'OK' });
+    }
+  } catch (error) {
+    log.error('Discord slash command handler error', error);
+    if (sink.hasResponded()) {
+      await interaction.followUp({
+        content: `Error: ${String((error as any)?.message ?? error)}`,
+      });
+      return;
+    }
+    await interaction.editReply({
+      content: `Error: ${String((error as any)?.message ?? error)}`,
+    });
+  }
+}
+
+function createDiscordInteractionSink(
+  interaction: ChatInputCommandInteraction,
+): OutboundSink & { flush: () => Promise<void>; hasResponded: () => boolean } {
+  let text = '';
+  let hasResponded = false;
+
+  const sendChunk = async (chunk: string): Promise<void> => {
+    if (!hasResponded) {
+      hasResponded = true;
+      if (interaction.deferred) {
+        await interaction.editReply({ content: chunk });
+        return;
+      }
+      if (interaction.replied) {
+        await interaction.followUp({ content: chunk });
+        return;
+      }
+      await interaction.reply({ content: chunk });
+      return;
+    }
+
+    await interaction.followUp({ content: chunk });
+  };
+
+  return {
+    sendText: async (delta) => {
+      text += delta;
+    },
+    flush: async () => {
+      const out = text.trim();
+      text = '';
+      if (!out) return;
+
+      const chunks = splitText(out, 1900);
+      for (const chunk of chunks) {
+        await sendChunk(chunk);
+      }
+    },
+    sendUi: async (event) => {
+      const head = `[${event.kind}] ${event.title}`;
+      const body =
+        event.mode === 'verbose' && event.detail ? `\n\n${event.detail}` : '';
+      await sendChunk(truncate(head + body, 1900));
+    },
+    hasResponded: () => hasResponded,
+  };
+}
+
+function splitText(text: string, maxLen: number): string[] {
+  if (!text) return [];
+
+  const out: string[] = [];
+  let remain = text;
+  while (remain.length > maxLen) {
+    out.push(remain.slice(0, maxLen));
+    remain = remain.slice(maxLen);
+  }
+  if (remain) out.push(remain);
+  return out;
+}
+
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 3) + '...';
+}
