@@ -4,7 +4,11 @@ import type { AppConfig } from '../config.js';
 import type { OutboundSink, UiMode } from './types.js';
 import { AcpClient, type PermissionRequest } from '../acp/client.js';
 import type { InitializeResult } from '../acp/types.js';
-import { updateAcpSessionId, updateLoadSupported } from './sessionStore.js';
+import {
+  SHARED_CHAT_SCOPE_USER_ID,
+  updateAcpSessionId,
+  updateLoadSupported,
+} from './sessionStore.js';
 import { ToolAuth, type ToolKind } from './toolAuth.js';
 
 export class BindingRuntime {
@@ -23,10 +27,12 @@ export class BindingRuntime {
   private activeSink: OutboundSink | null = null;
 
   private pendingPermission: PermissionRequest | null = null;
+  private pendingPermissionActorUserId: string | null = null;
 
   private currentRunId: string | null = null;
   private currentRunLastSeq = 0;
   private currentUiMode: UiMode = 'verbose';
+  private currentActorUserId: string | null = null;
 
   private readonly workspaceRoot: string;
 
@@ -167,6 +173,7 @@ export class BindingRuntime {
           if (!sink) return;
 
           this.pendingPermission = req;
+          this.pendingPermissionActorUserId = this.currentActorUserId;
 
           const toolKind = toToolKind(req.params.toolCall?.kind);
           if (toolKind) {
@@ -185,6 +192,7 @@ export class BindingRuntime {
                   optionId: option.optionId,
                 });
                 this.pendingPermission = null;
+                this.pendingPermissionActorUserId = null;
                 void sink.sendText(`[permission] auto-allowed (${toolKind})`);
                 return;
               }
@@ -199,6 +207,7 @@ export class BindingRuntime {
                   optionId: option.optionId,
                 });
                 this.pendingPermission = null;
+                this.pendingPermissionActorUserId = null;
                 void sink.sendText(`[permission] auto-rejected (${toolKind})`);
                 return;
               }
@@ -273,10 +282,19 @@ export class BindingRuntime {
     return this.pendingPermission;
   }
 
-  async selectPermissionOption(idx: number, sink: OutboundSink): Promise<void> {
+  async selectPermissionOption(
+    idx: number,
+    sink: OutboundSink,
+    actorUserId?: string,
+  ): Promise<void> {
     const pr = this.pendingPermission;
     if (!pr) {
       await sink.sendText('No pending permission request.');
+      return;
+    }
+
+    if (!this.isPermissionActorAuthorized(actorUserId)) {
+      await sink.sendText('Not authorized.');
       return;
     }
 
@@ -305,6 +323,7 @@ export class BindingRuntime {
     });
 
     this.pendingPermission = null;
+    this.pendingPermissionActorUserId = null;
     await sink.sendText(`OK: selected option ${idx} (${opt.name})`);
   }
 
@@ -315,6 +334,7 @@ export class BindingRuntime {
   async decidePermission(params: {
     decision: 'allow' | 'deny';
     requestId?: string;
+    actorUserId?: string;
   }): Promise<{ ok: boolean; message: string }> {
     const pr = this.pendingPermission;
     if (!pr) {
@@ -323,6 +343,10 @@ export class BindingRuntime {
 
     if (params.requestId && String(pr.requestId) !== params.requestId) {
       return { ok: false, message: 'Permission request expired.' };
+    }
+
+    if (!this.isPermissionActorAuthorized(params.actorUserId)) {
+      return { ok: false, message: 'Not authorized.' };
     }
 
     const toolKind = toToolKind(pr.params.toolCall?.kind);
@@ -356,6 +380,7 @@ export class BindingRuntime {
         optionId: selected.optionId,
       });
       this.pendingPermission = null;
+      this.pendingPermissionActorUserId = null;
 
       return {
         ok: true,
@@ -368,11 +393,12 @@ export class BindingRuntime {
 
     await this.client.respondPermission(pr, { kind: 'cancelled' });
     this.pendingPermission = null;
+    this.pendingPermissionActorUserId = null;
     return { ok: true, message: 'OK: cancelled permission request.' };
   }
 
-  async denyPermission(sink: OutboundSink): Promise<void> {
-    const res = await this.decidePermission({ decision: 'deny' });
+  async denyPermission(sink: OutboundSink, actorUserId?: string): Promise<void> {
+    const res = await this.decidePermission({ decision: 'deny', actorUserId });
     await sink.sendText(res.message);
   }
 
@@ -382,6 +408,7 @@ export class BindingRuntime {
     sink: OutboundSink;
     uiMode: UiMode;
     contextText?: string;
+    actorUserId?: string;
   }): Promise<{ stopReason: string; lastSeq: number }> {
     const next = this.queue.then(async () => {
       const isFreshSession = !this.acpSessionId;
@@ -390,6 +417,7 @@ export class BindingRuntime {
       this.currentRunId = params.runId;
       this.currentRunLastSeq = 0;
       this.currentUiMode = params.uiMode;
+      this.currentActorUserId = params.actorUserId ?? null;
       this.activeSink = params.sink;
 
       try {
@@ -417,6 +445,7 @@ export class BindingRuntime {
         this.activeSink = null;
         this.currentRunId = null;
         this.currentUiMode = 'verbose';
+        this.currentActorUserId = null;
       }
     });
 
@@ -427,6 +456,13 @@ export class BindingRuntime {
     );
 
     return next;
+  }
+
+  private isPermissionActorAuthorized(actorUserId?: string): boolean {
+    const expected = this.pendingPermissionActorUserId;
+    if (!expected || expected === SHARED_CHAT_SCOPE_USER_ID) return true;
+    if (!actorUserId) return true;
+    return expected === actorUserId;
   }
 }
 

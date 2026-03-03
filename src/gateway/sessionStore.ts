@@ -2,11 +2,18 @@ import type { Db } from '../db/db.js';
 
 export type Platform = 'discord' | 'telegram' | 'feishu';
 
+// Shared scope marker for group/channel conversations.
+export const SHARED_CHAT_SCOPE_USER_ID = '__chat_scope__';
+
 export type ConversationKey = {
   platform: Platform;
   chatId: string;
   threadId: string | null;
+  // Real actor user id for this incoming message.
   userId: string;
+  // Optional scope override for binding key derivation.
+  // When set (e.g. group/channel chats), conversation state is shared by that scope.
+  scopeUserId?: string | null;
 };
 
 export type SessionBinding = {
@@ -15,7 +22,16 @@ export type SessionBinding = {
 };
 
 export function bindingKeyFromConversationKey(key: ConversationKey): string {
-  return [key.platform, key.chatId, key.threadId ?? '-', key.userId].join(':');
+  return [
+    key.platform,
+    key.chatId,
+    key.threadId ?? '-',
+    bindingScopeUserId(key),
+  ].join(':');
+}
+
+export function bindingScopeUserId(key: ConversationKey): string {
+  return key.scopeUserId?.trim() ? key.scopeUserId : key.userId;
 }
 
 export function getBinding(
@@ -52,7 +68,7 @@ export function upsertBinding(
     key.platform,
     key.chatId,
     key.threadId,
-    key.userId,
+    bindingScopeUserId(key),
     sessionKey,
     now,
     now,

@@ -127,4 +127,11 @@ test('deliveryCheckpointStore upsert/get', () => {
 
   // binding key format stable
   assert.equal(bindingKeyFromConversationKey(key), 'discord:c:-:u');
+  assert.equal(
+    bindingKeyFromConversationKey({
+      ...key,
+      scopeUserId: '__chat_scope__',
+    }),
+    'discord:c:-:__chat_scope__',
+  );
 });

@@ -86,6 +86,16 @@ Telegram note:
 
 Set per conversation: `/ui verbose|summary`.
 
+## Conversation isolation
+
+- Discord:
+  - DM: isolated per user (DM channel)
+  - Guild channel: isolated per channel (shared across members in that channel)
+- Telegram:
+  - Private chat: isolated per user
+  - Group/supergroup/topic: isolated per chat (and topic thread when present)
+- Workspace root (`/workspace`) and run history follow the same binding scope.
+
 ## Memory (context replay)
 
 ACP sessions are process-local; if the gateway restarts (or an idle runtime is GC'ed), the new ACP session would otherwise start "blank".

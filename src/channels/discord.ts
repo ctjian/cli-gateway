@@ -8,7 +8,10 @@ import {
 import type { GatewayRouter, OutboundSink } from '../gateway/router.js';
 import type { AppConfig } from '../config.js';
 import { log } from '../logging.js';
-import type { ConversationKey } from '../gateway/sessionStore.js';
+import {
+  SHARED_CHAT_SCOPE_USER_ID,
+  type ConversationKey,
+} from '../gateway/sessionStore.js';
 import { createDiscordSink } from './discordSink.js';
 
 export type DiscordController = {
@@ -100,6 +103,8 @@ export async function startDiscord(
         chatId: message.channelId,
         threadId: null,
         userId: message.author.id,
+        scopeUserId:
+          message.guildId === null ? null : SHARED_CHAT_SCOPE_USER_ID,
       };
 
       const channel = message.channel as TextBasedChannel;

@@ -7,7 +7,10 @@ import type {
 } from '../gateway/router.js';
 import type { AppConfig } from '../config.js';
 import { log } from '../logging.js';
-import type { ConversationKey } from '../gateway/sessionStore.js';
+import {
+  SHARED_CHAT_SCOPE_USER_ID,
+  type ConversationKey,
+} from '../gateway/sessionStore.js';
 import { createTelegramSink } from './telegramSink.js';
 import { setChatMenuButton, setMessageReaction } from './telegramApi.js';
 
@@ -164,6 +167,8 @@ export async function startTelegram(
         chatId: String(ctx.chat.id),
         threadId,
         userId,
+        scopeUserId:
+          ctx.chat.type === 'private' ? null : SHARED_CHAT_SCOPE_USER_ID,
       };
 
       const inlineCommands = router.listCliInlineCommands(key);

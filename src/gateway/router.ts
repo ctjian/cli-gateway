@@ -14,6 +14,7 @@ import {
   finishRun,
   getBinding,
   getSession,
+  SHARED_CHAT_SCOPE_USER_ID,
   updateSessionCwd,
   upsertBinding,
   type ConversationKey,
@@ -258,7 +259,10 @@ export class GatewayRouter {
       return { ok: false, message: 'Permission binding platform mismatch.' };
     }
 
-    if (binding.userId !== params.actorUserId) {
+    if (
+      binding.userId !== params.actorUserId &&
+      binding.userId !== SHARED_CHAT_SCOPE_USER_ID
+    ) {
       return { ok: false, message: 'Not authorized.' };
     }
 
@@ -270,6 +274,7 @@ export class GatewayRouter {
     return entry.runtime.decidePermission({
       decision: params.decision,
       requestId: params.requestId,
+      actorUserId: params.actorUserId,
     });
   }
 
@@ -536,7 +541,7 @@ export class GatewayRouter {
           bindingKey,
         });
 
-        await rt.selectPermissionOption(idx, sink);
+        await rt.selectPermissionOption(idx, sink, key.userId);
         return true;
       }
 
@@ -553,7 +558,7 @@ export class GatewayRouter {
           bindingKey,
         });
 
-        await rt.denyPermission(sink);
+        await rt.denyPermission(sink, key.userId);
         return true;
       }
 
@@ -717,6 +722,7 @@ export class GatewayRouter {
         sink,
         uiMode,
         contextText,
+        actorUserId: key.userId,
       });
 
       finishRun(this.db, { runId, stopReason: result.stopReason });
