@@ -275,9 +275,27 @@ export class GatewayRouter {
     if (!text.startsWith('/')) return false;
 
     const parts = text.trim().split(/\s+/);
-    const cmd = parts[0];
+    const cmd = normalizeCommand(parts[0]);
 
     switch (cmd) {
+      case '/help': {
+        await sink.sendText(
+          [
+            'Commands:',
+            '/help',
+            '/ui verbose|summary',
+            '/workspace show|<absolute-path>',
+            '/new',
+            '/last',
+            '/replay [runId]',
+            '/allow <n>',
+            '/deny',
+            '/cron help',
+          ].join('\n'),
+        );
+        return true;
+      }
+
       case '/new': {
         const existing = getBinding(this.db, key);
         if (existing) {
@@ -731,4 +749,17 @@ function renderSessionUpdateDelta(update: any): string {
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return text.slice(0, max - 3) + '...';
+}
+
+function normalizeCommand(raw: string | undefined): string {
+  if (!raw) return '';
+  const command = raw.toLowerCase();
+
+  // Telegram commands may include "/cmd@botname". Keep only "/cmd".
+  const at = command.indexOf('@');
+  if (at > 1 && command.startsWith('/')) {
+    return command.slice(0, at);
+  }
+
+  return command;
 }

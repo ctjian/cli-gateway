@@ -41,7 +41,9 @@ export function acquireProcessLock(lockPath: string): ProcessLock {
     // If lock exists, verify the process is alive.
     const existing = readLockFile(lockPath);
     if (existing?.pid && isPidAlive(existing.pid)) {
-      throw new Error(`Another instance is running (pid=${existing.pid})`);
+      throw new Error(`Another instance is running (pid=${existing.pid})`, {
+        cause: err,
+      });
     }
 
     // Stale lock.

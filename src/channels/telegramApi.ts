@@ -82,3 +82,29 @@ export async function setMessageReaction(
     );
   }
 }
+
+export async function setChatMenuButton(
+  token: string,
+  params: {
+    chatId?: number;
+  },
+  fetchFn: typeof fetch = fetch,
+): Promise<void> {
+  const payload: any = {
+    menu_button: { type: 'commands' },
+  };
+  if (params.chatId !== undefined) payload.chat_id = params.chatId;
+
+  const json = await callTelegram<boolean>(
+    token,
+    'setChatMenuButton',
+    payload,
+    fetchFn,
+  );
+
+  if (!json.ok) {
+    throw new Error(
+      `setChatMenuButton failed: ${json.error_code ?? ''} ${json.description ?? ''}`,
+    );
+  }
+}

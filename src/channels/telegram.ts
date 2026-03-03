@@ -51,7 +51,7 @@ export async function startTelegram(
     .catch((err) => log.warn('Telegram setMyCommands(admins) error', err));
 
   // Force Telegram UI to show the command menu button.
-  void setChatMenuButton(config.telegramToken, {}, fetch).catch((err) =>
+  void setChatMenuButton(config.telegramToken, {}, fetch).catch((err: unknown) =>
     log.warn('Telegram setChatMenuButton(default) error', err),
   );
 
@@ -135,6 +135,12 @@ export async function startTelegram(
       const text = ctx.message.text?.trim() ?? '';
       if (!text) return;
 
+      log.info('telegram inbound message', {
+        chatId: ctx.chat.id,
+        fromId: ctx.from?.id,
+        text: text.slice(0, 120),
+      });
+
       // Per-chat: ensure menu button is commands.
       void setChatMenuButton(config.telegramToken, { chatId: ctx.chat.id }, fetch).catch(
         () => {
@@ -162,6 +168,7 @@ export async function startTelegram(
         ? createTelegramCommandSink(bot, ctx.chat.id, threadId ? Number(threadId) : null)
         : createTelegramSink(
             bot,
+            config.telegramToken,
             ctx.chat.id,
             threadId ? Number(threadId) : null,
             userId,
@@ -223,29 +230,48 @@ export async function startTelegram(
     log.error('Telegram bot error', err);
   });
 
-  // Ensure webhook is disabled and clear backlog.
-  void bot.api
-    .deleteWebhook({ drop_pending_updates: true })
-    .catch((err) => log.warn('Telegram deleteWebhook error', err));
-
-  try {
-    bot.start({
-      allowed_updates: ['message', 'callback_query'],
-    });
-    log.info('Telegram bot started (long polling)');
-  } catch (err) {
-    log.error('Telegram bot start error', err);
-  }
+  void startLongPolling(bot);
 
   return {
     createSink: (chatId, threadId, userId) =>
       createTelegramSink(
         bot,
+        config.telegramToken,
         Number(chatId),
         threadId ? Number(threadId) : null,
         userId,
       ),
   };
+}
+
+async function startLongPolling(bot: Bot): Promise<void> {
+  for (;;) {
+    try {
+      await bot.api.deleteWebhook({ drop_pending_updates: true });
+    } catch (err) {
+      log.warn('Telegram deleteWebhook error', err);
+    }
+
+    log.info('Telegram long polling start', {
+      allowedUpdates: ['message', 'callback_query'],
+      dropPendingUpdates: true,
+    });
+
+    try {
+      await bot.start({
+        allowed_updates: ['message', 'callback_query'],
+      });
+      log.warn('Telegram polling stopped; restarting in 2s');
+    } catch (err) {
+      log.error('Telegram polling error; restarting in 2s', err);
+    }
+
+    await sleep(2000);
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createTelegramCommandSink(
