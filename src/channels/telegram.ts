@@ -1,6 +1,10 @@
 import { Bot } from 'grammy';
 
-import type { GatewayRouter, OutboundSink } from '../gateway/router.js';
+import type {
+  CliInlineCommand,
+  GatewayRouter,
+  OutboundSink,
+} from '../gateway/router.js';
 import type { AppConfig } from '../config.js';
 import { log } from '../logging.js';
 import type { ConversationKey } from '../gateway/sessionStore.js';
@@ -25,6 +29,7 @@ export async function startTelegram(
   }
 
   const bot = new Bot(config.telegramToken);
+  const chatCommandSignatures = new Map<number, string>();
 
   const tgCommands = [
     { command: 'help', description: 'Show commands' },
@@ -161,8 +166,22 @@ export async function startTelegram(
         userId,
       };
 
+      const inlineCommands = router.listCliInlineCommands(key);
+
+      // Keep Telegram chat-scope command menu in sync with CLI inline commands.
+      void syncTelegramCommandsForChat({
+        bot,
+        chatId: ctx.chat.id,
+        baseCommands: tgCommands,
+        inlineCommands,
+        signatures: chatCommandSignatures,
+      }).catch(() => {
+        // ignore
+      });
+
       // /start should show help, not fall through to the agent.
-      const normalizedText = text.startsWith('/start') ? '/help' : text;
+      const remapped = remapTelegramInlineCommand(text, inlineCommands);
+      const normalizedText = remapped.startsWith('/start') ? '/help' : remapped;
 
       const sink = normalizedText.startsWith('/')
         ? createTelegramCommandSink(bot, ctx.chat.id, threadId ? Number(threadId) : null)
@@ -203,6 +222,17 @@ export async function startTelegram(
             },
             fetch,
           );
+
+          // Commands may change after this run (available_commands_update).
+          void syncTelegramCommandsForChat({
+            bot,
+            chatId: ctx.chat.id,
+            baseCommands: tgCommands,
+            inlineCommands: router.listCliInlineCommands(key),
+            signatures: chatCommandSignatures,
+          }).catch(() => {
+            // ignore
+          });
         })
         .catch(async (error) => {
           log.error('Telegram router handler error', error);
@@ -272,6 +302,90 @@ async function startLongPolling(bot: Bot): Promise<void> {
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function remapTelegramInlineCommand(
+  text: string,
+  inlineCommands: CliInlineCommand[],
+): string {
+  if (!text.startsWith('/')) return text;
+
+  const parts = text.trim().split(/\s+/);
+  const first = parts[0] ?? '';
+
+  const at = first.indexOf('@');
+  const cmdToken = at >= 0 ? first.slice(0, at) : first;
+  if (!cmdToken.startsWith('/')) return text;
+
+  const cmd = cmdToken.slice(1).toLowerCase();
+  if (!cmd) return text;
+
+  const aliasMap = new Map<string, string>();
+  for (const item of inlineCommands) {
+    const tg = toTelegramCommandName(item.name);
+    if (!tg || tg === item.name) continue;
+    if (!aliasMap.has(tg)) aliasMap.set(tg, item.name);
+  }
+
+  const mapped = aliasMap.get(cmd);
+  if (!mapped) return text;
+
+  parts[0] = `/${mapped}`;
+  return parts.join(' ');
+}
+
+async function syncTelegramCommandsForChat(params: {
+  bot: Bot;
+  chatId: number;
+  baseCommands: Array<{ command: string; description: string }>;
+  inlineCommands: CliInlineCommand[];
+  signatures: Map<number, string>;
+}): Promise<void> {
+  const merged = [...params.baseCommands];
+  const seen = new Set<string>(params.baseCommands.map((c) => c.command));
+
+  for (const item of params.inlineCommands) {
+    const command = toTelegramCommandName(item.name);
+    if (!command || seen.has(command)) continue;
+
+    merged.push({
+      command,
+      description: truncateTelegramDescription(
+        `cli-inline: ${item.description || item.name}`,
+      ),
+    });
+    seen.add(command);
+
+    // Telegram Bot API hard limit.
+    if (merged.length >= 100) break;
+  }
+
+  const signature = JSON.stringify(merged);
+  if (params.signatures.get(params.chatId) === signature) return;
+
+  await params.bot.api.setMyCommands(merged, {
+    scope: { type: 'chat', chat_id: params.chatId },
+  });
+  params.signatures.set(params.chatId, signature);
+}
+
+function toTelegramCommandName(name: string): string | null {
+  const normalized = name
+    .trim()
+    .toLowerCase()
+    .replaceAll('-', '_')
+    .replace(/[^a-z0-9_]/g, '');
+
+  if (!normalized) return null;
+  if (normalized.length > 32) return null;
+  if (!/^[a-z]/.test(normalized)) return null;
+  return normalized;
+}
+
+function truncateTelegramDescription(text: string): string {
+  const trimmed = text.trim() || 'cli-inline command';
+  if (trimmed.length <= 256) return trimmed;
+  return trimmed.slice(0, 253) + '...';
 }
 
 function createTelegramCommandSink(

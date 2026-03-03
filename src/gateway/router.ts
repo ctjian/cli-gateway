@@ -34,6 +34,12 @@ import { buildReplayContextFromRecentRuns } from './history.js';
 
 export type { OutboundSink } from './types.js';
 
+export type CliInlineCommand = {
+  name: string;
+  description: string;
+  inputHint: string | null;
+};
+
 export class GatewayRouter {
   private readonly db: Db;
   private readonly config: AppConfig;
@@ -279,6 +285,19 @@ export class GatewayRouter {
 
     switch (cmd) {
       case '/help': {
+        const inline = this.listCliInlineCommands(key);
+        const inlineLines = inline.length
+          ? [
+              '',
+              'CLI Inline Commands:',
+              ...inline.map((cmd) => {
+                const desc = truncate(cmd.description, 120);
+                const hint = cmd.inputHint ? ` (input: ${truncate(cmd.inputHint, 40)})` : '';
+                return `/${cmd.name} (cli-inline) - ${desc}${hint}`;
+              }),
+            ]
+          : [];
+
         await sink.sendText(
           [
             'Commands:',
@@ -291,6 +310,7 @@ export class GatewayRouter {
             '/allow <n>',
             '/deny',
             '/cron help',
+            ...inlineLines,
           ].join('\n'),
         );
         return true;
@@ -724,6 +744,57 @@ export class GatewayRouter {
           text: state.text,
         });
       }
+    }
+  }
+
+  listCliInlineCommands(key: ConversationKey): CliInlineCommand[] {
+    const binding = getBinding(this.db, key);
+    if (!binding) return [];
+    return this.listCliInlineCommandsBySession(binding.sessionKey);
+  }
+
+  listCliInlineCommandsBySession(sessionKey: string): CliInlineCommand[] {
+    const row = this.db
+      .prepare(
+        `
+        SELECT e.payload_json as payloadJson
+        FROM events e
+        JOIN runs r ON r.run_id = e.run_id
+        WHERE
+          r.session_key = ?
+          AND e.method = 'session/update'
+          AND json_extract(e.payload_json, '$.update.sessionUpdate') = 'available_commands_update'
+        ORDER BY e.created_at DESC, e.seq DESC
+        LIMIT 1
+        `,
+      )
+      .get(sessionKey) as { payloadJson: string } | undefined;
+
+    if (!row?.payloadJson) return [];
+
+    try {
+      const payload = JSON.parse(row.payloadJson);
+      const list = payload?.update?.availableCommands;
+      if (!Array.isArray(list)) return [];
+
+      const out: CliInlineCommand[] = [];
+      const seen = new Set<string>();
+
+      for (const item of list) {
+        const name = String(item?.name ?? '').trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+
+        out.push({
+          name,
+          description: String(item?.description ?? '').trim(),
+          inputHint: item?.input?.hint ? String(item.input.hint) : null,
+        });
+      }
+
+      return out;
+    } catch {
+      return [];
     }
   }
 }

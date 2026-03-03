@@ -67,6 +67,10 @@ Feishu currently runs in webhook event-subscription mode:
 - `/replay [runId]` replay stored `session/update` output for a run (best-effort)
 - `/ui verbose|summary` set UI verbosity for this conversation
 - `/workspace show|~|~/...|/abs/path` show/set per-conversation workspace root (alias: `/ws`)
+- `/help` also includes ACP `available_commands_update` entries as `cli-inline` commands (best-effort)
+
+Telegram note:
+- Chat-scoped command menu is synced best-effort from `cli-inline` commands. Commands with `-` are mapped to `_` in Telegram UI.
 
 ## Security model (default)
 
