@@ -407,7 +407,15 @@ export class AcpClient {
     return new Promise<TResult>((resolve, reject) => {
       this.pending.set(id, (res) => {
         if ('error' in res) {
-          reject(new Error(res.error.message));
+          const code =
+            typeof res.error?.code === 'number'
+              ? ` (code ${res.error.code})`
+              : '';
+          const data =
+            res.error?.data !== undefined
+              ? `; data=${String(res.error.data)}`
+              : '';
+          reject(new Error(`${res.error.message}${code}${data}`));
           return;
         }
         resolve(res.result as TResult);

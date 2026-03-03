@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  type Attachment,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -10,7 +11,11 @@ import {
   type TextBasedChannel,
 } from 'discord.js';
 
-import type { GatewayRouter, OutboundSink } from '../gateway/router.js';
+import type {
+  GatewayRouter,
+  OutboundSink,
+  UserResource,
+} from '../gateway/router.js';
 import type { AppConfig } from '../config.js';
 import { log } from '../logging.js';
 import {
@@ -134,7 +139,10 @@ export async function startDiscord(
       }
 
       const text = message.content ?? '';
-      if (!text.trim()) return;
+      const resources = extractDiscordImageResources(
+        message.attachments.map((a) => a),
+      );
+      if (!text.trim() && resources.length === 0) return;
 
       const key: ConversationKey = {
         platform: 'discord',
@@ -148,7 +156,7 @@ export async function startDiscord(
       const channel = message.channel as TextBasedChannel;
       const sink = createDiscordSink(channel, message.author.id);
 
-      await router.handleUserMessage(key, text, sink);
+      await router.handleUserMessage(key, text, sink, { resources });
     } catch (error) {
       log.error('Discord message handler error', error);
     }
@@ -167,6 +175,32 @@ export async function startDiscord(
   };
 }
 /* c8 ignore stop */
+
+function extractDiscordImageResources(
+  attachments: Attachment[],
+): UserResource[] {
+  const out: UserResource[] = [];
+  const seen = new Set<string>();
+
+  for (const item of attachments) {
+    const uri = String(item.url ?? '').trim();
+    if (!uri || seen.has(uri)) continue;
+
+    const mime = String(item.contentType ?? '').trim().toLowerCase();
+    const looksLikeImage =
+      mime.startsWith('image/') ||
+      item.width !== null ||
+      item.height !== null ||
+      /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(uri);
+
+    if (!looksLikeImage) continue;
+
+    seen.add(uri);
+    out.push({ uri, mimeType: mime || undefined });
+  }
+
+  return out;
+}
 
 async function syncDiscordSlashCommands(
   client: Client,

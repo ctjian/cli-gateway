@@ -175,6 +175,206 @@ class FakeRpc implements StdioProcess {
   }
 }
 
+class SummaryFilterRpc implements StdioProcess {
+  private messageHandlers: Array<(m: JsonRpcMessage) => void> = [];
+  private promptRequestId: number | null = null;
+  private sessionId = 'sess-summary';
+
+  write(message: JsonRpcMessage): void {
+    if ('method' in message) {
+      const req = message as JsonRpcRequest;
+
+      if (req.method === 'initialize') {
+        queueMicrotask(() => {
+          this.emit({
+            jsonrpc: '2.0',
+            id: req.id,
+            result: {
+              protocolVersion: 1,
+              agentCapabilities: { loadSession: false },
+            },
+          } as JsonRpcResponse);
+        });
+        return;
+      }
+
+      if (req.method === 'session/new') {
+        queueMicrotask(() => {
+          this.emit({
+            jsonrpc: '2.0',
+            id: req.id,
+            result: { sessionId: this.sessionId },
+          } as JsonRpcResponse);
+        });
+        return;
+      }
+
+      if (req.method === 'session/prompt') {
+        this.promptRequestId = Number(req.id);
+
+        queueMicrotask(() => {
+          this.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: this.sessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                title: 'call_1234',
+              },
+            },
+          } as any);
+
+          this.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: this.sessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                title: 'terminal/create',
+              },
+            },
+          } as any);
+
+          this.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: this.sessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                title: 'terminal/create',
+              },
+            },
+          } as any);
+
+          this.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: this.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'done' },
+              },
+            },
+          } as any);
+
+          this.emit({
+            jsonrpc: '2.0',
+            id: this.promptRequestId!,
+            result: { stopReason: 'end' },
+          } as JsonRpcResponse);
+        });
+      }
+    }
+  }
+
+  onMessage(cb: (message: JsonRpcMessage) => void): void {
+    this.messageHandlers.push(cb);
+  }
+
+  onStderr(): void {
+    // noop
+  }
+
+  kill(): void {
+    // noop
+  }
+
+  private emit(message: JsonRpcMessage): void {
+    this.messageHandlers.forEach((h) => h(message));
+  }
+}
+
+class UiFlushRpc implements StdioProcess {
+  private messageHandlers: Array<(m: JsonRpcMessage) => void> = [];
+  private sessionId = 'sess-ui-flush';
+  private promptRequestId: number | null = null;
+
+  write(message: JsonRpcMessage): void {
+    if (!('method' in message)) return;
+    const req = message as JsonRpcRequest;
+
+    if (req.method === 'initialize') {
+      queueMicrotask(() => {
+        this.emit({
+          jsonrpc: '2.0',
+          id: req.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: false },
+          },
+        } as JsonRpcResponse);
+      });
+      return;
+    }
+
+    if (req.method === 'session/new') {
+      queueMicrotask(() => {
+        this.emit({
+          jsonrpc: '2.0',
+          id: req.id,
+          result: { sessionId: this.sessionId },
+        } as JsonRpcResponse);
+      });
+      return;
+    }
+
+    if (req.method === 'session/prompt') {
+      this.promptRequestId = Number(req.id);
+      queueMicrotask(() => {
+        this.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              title: 'terminal/create',
+            },
+          },
+        } as any);
+
+        this.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'done' },
+            },
+          },
+        } as any);
+
+        this.emit({
+          jsonrpc: '2.0',
+          id: this.promptRequestId!,
+          result: { stopReason: 'end' },
+        } as JsonRpcResponse);
+      });
+    }
+  }
+
+  onMessage(cb: (message: JsonRpcMessage) => void): void {
+    this.messageHandlers.push(cb);
+  }
+
+  onStderr(): void {
+    // noop
+  }
+
+  kill(): void {
+    // noop
+  }
+
+  private emit(message: JsonRpcMessage): void {
+    this.messageHandlers.forEach((h) => h(message));
+  }
+}
+
 test('BindingRuntime prompt emits plan/tool UI and supports interactive permission', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
@@ -287,6 +487,202 @@ test('BindingRuntime prompt emits plan/tool UI and supports interactive permissi
 
   // ensure allow decision granted exactly once
   assert.equal(toolAuth.consume(sessionKey, 'read'), false);
+
+  rt.close();
+  db.close();
+});
+
+test('BindingRuntime summary filters call_* tool titles and keeps named tools', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync('/tmp/cli-gateway-test-');
+
+  const key: ConversationKey = {
+    platform: 'telegram',
+    chatId: 'c',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const sessionKey = 's2';
+  createSession(db, {
+    sessionKey,
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: workspaceRoot,
+    loadSupported: false,
+  });
+
+  const bindingKey = upsertBinding(db, key, sessionKey).bindingKey;
+  const toolAuth = new ToolAuth(db);
+
+  const rt = new BindingRuntime({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot,
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'summary',
+      uiJsonMaxChars: 10_000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    toolAuth,
+    sessionKey,
+    bindingKey,
+    acpRpc: new SummaryFilterRpc(),
+    workspaceRoot,
+  });
+
+  const uiEvents: UiEvent[] = [];
+  const chunks: string[] = [];
+  const sink: OutboundSink = {
+    sendText: async (t) => {
+      chunks.push(t);
+    },
+    sendUi: async (e) => {
+      uiEvents.push(e);
+    },
+  };
+
+  createRun(db, { runId: 'r2', sessionKey, promptText: 'go' });
+
+  const out = await rt.prompt({
+    runId: 'r2',
+    promptText: 'go',
+    sink,
+    uiMode: 'summary',
+  });
+
+  assert.equal(out.stopReason, 'end');
+  assert.ok(chunks.join('').includes('done'));
+
+  const toolTitles = uiEvents
+    .filter((e) => e.kind === 'tool')
+    .map((e) => e.title);
+
+  assert.deepEqual(toolTitles, ['terminal/create']);
+
+  rt.close();
+  db.close();
+});
+
+test('BindingRuntime prompt waits for pending summary tool UI delivery', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync('/tmp/cli-gateway-test-');
+
+  const key: ConversationKey = {
+    platform: 'telegram',
+    chatId: 'c',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const sessionKey = 's3';
+  createSession(db, {
+    sessionKey,
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: workspaceRoot,
+    loadSupported: false,
+  });
+
+  const bindingKey = upsertBinding(db, key, sessionKey).bindingKey;
+  const toolAuth = new ToolAuth(db);
+
+  const rt = new BindingRuntime({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot,
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'summary',
+      uiJsonMaxChars: 10_000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    toolAuth,
+    sessionKey,
+    bindingKey,
+    acpRpc: new UiFlushRpc(),
+    workspaceRoot,
+  });
+
+  createRun(db, { runId: 'r3', sessionKey, promptText: 'go' });
+
+  let uiStarted = false;
+  let releaseUi: () => void = () => {};
+  const uiReleaseGate = new Promise<void>((resolve) => {
+    releaseUi = resolve;
+  });
+
+  const uiEvents: UiEvent[] = [];
+  const chunks: string[] = [];
+  const sink: OutboundSink = {
+    sendText: async (t) => {
+      chunks.push(t);
+    },
+    sendUi: async (e) => {
+      uiStarted = true;
+      await uiReleaseGate;
+      uiEvents.push(e);
+    },
+  };
+
+  const pending = rt.prompt({
+    runId: 'r3',
+    promptText: 'go',
+    sink,
+    uiMode: 'summary',
+  });
+
+  await waitUntil(() => uiStarted);
+
+  let resolved = false;
+  void pending.then(() => {
+    resolved = true;
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(resolved, false);
+
+  releaseUi();
+  const out = await pending;
+
+  assert.equal(out.stopReason, 'end');
+  assert.ok(chunks.join('').includes('done'));
+  assert.deepEqual(
+    uiEvents.filter((e) => e.kind === 'tool').map((e) => e.title),
+    ['terminal/create'],
+  );
 
   rt.close();
   db.close();

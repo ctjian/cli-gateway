@@ -41,6 +41,15 @@ export type CliInlineCommand = {
   inputHint: string | null;
 };
 
+export type UserResource = {
+  uri: string;
+  mimeType?: string;
+};
+
+export type UserMessageOptions = {
+  resources?: UserResource[];
+};
+
 export class GatewayRouter {
   private readonly db: Db;
   private readonly config: AppConfig;
@@ -666,6 +675,7 @@ export class GatewayRouter {
     key: ConversationKey,
     text: string,
     sink: OutboundSink,
+    options?: UserMessageOptions,
   ): Promise<void> {
     const commandHandled = await this.handleCommand(key, text, sink);
     if (commandHandled) {
@@ -674,6 +684,12 @@ export class GatewayRouter {
       } catch (error) {
         log.warn('sink flush error (command)', error);
       }
+      return;
+    }
+
+    const normalizedText = text.trim();
+    const resources = sanitizeResources(options?.resources);
+    if (!normalizedText && resources.length === 0) {
       return;
     }
 
@@ -697,7 +713,11 @@ export class GatewayRouter {
     }
 
     const runId = randomUUID();
-    createRun(this.db, { runId, sessionKey, promptText: text });
+    createRun(this.db, {
+      runId,
+      sessionKey,
+      promptText: formatPromptTextForStorage(text, resources),
+    });
 
     let contextText = '';
     if (
@@ -718,7 +738,10 @@ export class GatewayRouter {
 
       const result = await rt.prompt({
         runId,
-        promptText: text,
+        promptText:
+          normalizedText ||
+          (resources.length > 0 ? 'User sent image attachment(s).' : text),
+        promptResources: resources,
         sink,
         uiMode,
         contextText,
@@ -839,4 +862,36 @@ function normalizeCommand(raw: string | undefined): string {
   }
 
   return command;
+}
+
+function sanitizeResources(resources: UserMessageOptions['resources']): UserResource[] {
+  if (!resources || resources.length === 0) return [];
+
+  const out: UserResource[] = [];
+  const seen = new Set<string>();
+
+  for (const item of resources) {
+    const uri = String(item?.uri ?? '').trim();
+    if (!uri || seen.has(uri)) continue;
+    seen.add(uri);
+    out.push({
+      uri,
+      mimeType: item?.mimeType?.trim() || undefined,
+    });
+  }
+
+  return out;
+}
+
+function formatPromptTextForStorage(text: string, resources: UserResource[]): string {
+  const trimmed = text.trim();
+  if (resources.length === 0) return text;
+
+  const attachmentSummary =
+    resources.length === 1
+      ? '[attachment] image'
+      : `[attachments] ${resources.length} images`;
+
+  if (!trimmed) return attachmentSummary;
+  return `${text}\n${attachmentSummary}`;
 }

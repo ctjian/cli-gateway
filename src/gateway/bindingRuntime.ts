@@ -3,7 +3,7 @@ import type { Db } from '../db/db.js';
 import type { AppConfig } from '../config.js';
 import type { OutboundSink, UiMode } from './types.js';
 import { AcpClient, type PermissionRequest } from '../acp/client.js';
-import type { InitializeResult } from '../acp/types.js';
+import type { ContentBlock, InitializeResult } from '../acp/types.js';
 import {
   SHARED_CHAT_SCOPE_USER_ID,
   updateAcpSessionId,
@@ -33,6 +33,8 @@ export class BindingRuntime {
   private currentRunLastSeq = 0;
   private currentUiMode: UiMode = 'verbose';
   private currentActorUserId: string | null = null;
+  private sinkWriteQueue: Promise<void> = Promise.resolve();
+  private summaryToolSeen = new Set<string>();
 
   private readonly workspaceRoot: string;
 
@@ -60,29 +62,126 @@ export class BindingRuntime {
       toolAuth: this.toolAuth,
       rpc: params.acpRpc,
       events: {
-        onSessionUpdate: async (run, _sessionId, update, eventSeq) => {
+        onSessionUpdate: (run, _sessionId, update, eventSeq) => {
           if (run.runId === this.currentRunId) {
             this.currentRunLastSeq = Math.max(this.currentRunLastSeq, eventSeq);
           }
 
-          const sink = this.activeSink;
-          if (!sink) return;
+          this.enqueueSinkWrite(async () => {
+            if (run.runId !== this.currentRunId) return;
 
-          if (update?.sessionUpdate === 'agent_message_chunk') {
-            const block = update?.content;
-            const text = block?.text ?? '';
-            if (!text) return;
-            await sink.sendText(text);
-          }
+            const sink = this.activeSink;
+            if (!sink) return;
 
-          if (
-            update?.sessionUpdate === 'tool_call' ||
-            update?.sessionUpdate === 'tool_call_update'
-          ) {
-            const title = String(update?.title ?? update?.toolCallId ?? 'tool_call');
+            if (update?.sessionUpdate === 'agent_message_chunk') {
+              const block = update?.content;
+              const text = block?.text ?? '';
+              if (!text) return;
+              if (sink.sendAgentText) {
+                await sink.sendAgentText(text);
+              } else {
+                await sink.sendText(text);
+              }
+            }
+
+            if (
+              update?.sessionUpdate === 'tool_call' ||
+              update?.sessionUpdate === 'tool_call_update'
+            ) {
+              const rawTitle = String(
+                update?.title ?? update?.toolCallId ?? 'tool_call',
+              );
+              const title =
+                this.currentUiMode === 'summary'
+                  ? this.selectSummaryToolTitle(rawTitle)
+                  : rawTitle;
+              if (!title) return;
+
+              const detail =
+                this.currentUiMode === 'verbose'
+                  ? renderJson(update, this.config.uiJsonMaxChars)
+                  : undefined;
+
+              if (!sink.sendUi && this.currentUiMode === 'summary') {
+                return;
+              }
+
+              if (sink.sendUi) {
+                await sink.sendUi({
+                  kind: 'tool',
+                  mode: this.currentUiMode,
+                  title,
+                  detail,
+                });
+              } else {
+                await sink.sendText(
+                  this.currentUiMode === 'verbose'
+                    ? `\n[tool]\n${title}\n${detail ?? ''}\n`
+                    : `\n[tool] ${title}`,
+                );
+              }
+            }
+
+            if (update?.sessionUpdate === 'plan') {
+              const detail = renderJson(update, this.config.uiJsonMaxChars);
+              if (sink.sendUi) {
+                await sink.sendUi({
+                  kind: 'plan',
+                  mode: this.currentUiMode,
+                  title: 'Plan updated',
+                  detail: this.currentUiMode === 'verbose' ? detail : undefined,
+                });
+              } else {
+                await sink.sendText(
+                  this.currentUiMode === 'verbose'
+                    ? `\n[plan]\n${detail}\n`
+                    : '\n[plan updated]\n',
+                );
+              }
+            }
+
+            if (update?.sessionUpdate === 'task') {
+              const detail = renderJson(update, this.config.uiJsonMaxChars);
+              if (sink.sendUi) {
+                await sink.sendUi({
+                  kind: 'task',
+                  mode: this.currentUiMode,
+                  title: 'Task update',
+                  detail: this.currentUiMode === 'verbose' ? detail : undefined,
+                });
+              } else {
+                await sink.sendText(
+                  this.currentUiMode === 'verbose'
+                    ? `\n[task]\n${detail}\n`
+                    : '\n[task updated]\n',
+                );
+              }
+            }
+          });
+        },
+        onClientTool: (run, event) => {
+          this.enqueueSinkWrite(async () => {
+            const sink = this.activeSink;
+            if (!sink) return;
+
+            if (run.runId !== this.currentRunId) return;
+
+            let title = `${event.method} (${event.phase})`;
+            if (this.currentUiMode === 'summary') {
+              if (event.phase !== 'start') return;
+              const selected = this.selectSummaryToolTitle(
+                event.method,
+              );
+              if (!selected) return;
+              title = selected;
+            }
+
             const detail =
               this.currentUiMode === 'verbose'
-                ? renderJson(update, this.config.uiJsonMaxChars)
+                ? renderJson(
+                    { params: event.params, result: event.result, error: event.error },
+                    this.config.uiJsonMaxChars,
+                  )
                 : undefined;
 
             if (sink.sendUi) {
@@ -92,86 +191,19 @@ export class BindingRuntime {
                 title,
                 detail,
               });
-            } else {
-              await sink.sendText(
-                this.currentUiMode === 'verbose'
-                  ? `\n[tool]\n${title}\n${detail ?? ''}\n`
-                  : `\n[tool] ${title}`,
-              );
+              return;
             }
-          }
 
-          if (update?.sessionUpdate === 'plan') {
-            const detail = renderJson(update, this.config.uiJsonMaxChars);
-            if (sink.sendUi) {
-              await sink.sendUi({
-                kind: 'plan',
-                mode: this.currentUiMode,
-                title: 'Plan updated',
-                detail: this.currentUiMode === 'verbose' ? detail : undefined,
-              });
-            } else {
-              await sink.sendText(
-                this.currentUiMode === 'verbose'
-                  ? `\n[plan]\n${detail}\n`
-                  : '\n[plan updated]\n',
-              );
-            }
-          }
+            if (this.currentUiMode === 'summary') return;
 
-          if (update?.sessionUpdate === 'task') {
-            const detail = renderJson(update, this.config.uiJsonMaxChars);
-            if (sink.sendUi) {
-              await sink.sendUi({
-                kind: 'task',
-                mode: this.currentUiMode,
-                title: 'Task update',
-                detail: this.currentUiMode === 'verbose' ? detail : undefined,
-              });
-            } else {
-              await sink.sendText(
-                this.currentUiMode === 'verbose'
-                  ? `\n[task]\n${detail}\n`
-                  : '\n[task updated]\n',
-              );
-            }
-          }
-        },
-        onClientTool: (run, event) => {
-          const sink = this.activeSink;
-          if (!sink) return;
-
-          if (run.runId !== this.currentRunId) return;
-
-          const title = `${event.method} (${event.phase})`;
-          const detail =
-            this.currentUiMode === 'verbose'
-              ? renderJson(
-                  { params: event.params, result: event.result, error: event.error },
-                  this.config.uiJsonMaxChars,
-                )
-              : undefined;
-
-          if (sink.sendUi) {
-            void sink.sendUi({
-              kind: 'tool',
-              mode: this.currentUiMode,
-              title,
-              detail,
-            });
-            return;
-          }
-
-          void sink.sendText(
-            this.currentUiMode === 'verbose'
-              ? `\n[tool] ${title}\n${detail ?? ''}\n`
-              : `\n[tool] ${title}`,
-          );
+            await sink.sendText(
+              this.currentUiMode === 'verbose'
+                ? `\n[tool] ${title}\n${detail ?? ''}\n`
+                : `\n[tool] ${title}`,
+            );
+          });
         },
         onPermissionRequest: (req) => {
-          const sink = this.activeSink;
-          if (!sink) return;
-
           this.pendingPermission = req;
           this.pendingPermissionActorUserId = this.currentActorUserId;
 
@@ -193,7 +225,11 @@ export class BindingRuntime {
                 });
                 this.pendingPermission = null;
                 this.pendingPermissionActorUserId = null;
-                void sink.sendText(`[permission] auto-allowed (${toolKind})`);
+                this.enqueueSinkWrite(async () => {
+                  const sink = this.activeSink;
+                  if (!sink) return;
+                  await sink.sendText(`[permission] auto-allowed (${toolKind})`);
+                });
                 return;
               }
             }
@@ -208,7 +244,11 @@ export class BindingRuntime {
                 });
                 this.pendingPermission = null;
                 this.pendingPermissionActorUserId = null;
-                void sink.sendText(`[permission] auto-rejected (${toolKind})`);
+                this.enqueueSinkWrite(async () => {
+                  const sink = this.activeSink;
+                  if (!sink) return;
+                  await sink.sendText(`[permission] auto-rejected (${toolKind})`);
+                });
                 return;
               }
             }
@@ -219,18 +259,23 @@ export class BindingRuntime {
             req.params.toolCall?.toolCallId ??
             'tool_call';
 
-          if (sink.requestPermission) {
-            void sink.requestPermission({
-              uiMode: this.currentUiMode,
-              sessionKey: this.sessionKey,
-              requestId: String(req.requestId),
-              toolTitle: title,
-              toolKind: toolKind ?? null,
-            });
-            return;
-          }
+          this.enqueueSinkWrite(async () => {
+            const sink = this.activeSink;
+            if (!sink) return;
 
-          void sink.sendText(formatPermissionRequest(req));
+            if (sink.requestPermission) {
+              await sink.requestPermission({
+                uiMode: this.currentUiMode,
+                sessionKey: this.sessionKey,
+                requestId: String(req.requestId),
+                toolTitle: title,
+                toolKind: toolKind ?? null,
+              });
+              return;
+            }
+
+            await sink.sendText(formatPermissionRequest(req));
+          });
         },
         onAgentStderr: (line) => {
           log.debug('[agent stderr]', line);
@@ -241,6 +286,20 @@ export class BindingRuntime {
 
   close(): void {
     this.client.close();
+  }
+
+  private enqueueSinkWrite(action: () => Promise<void>): void {
+    this.sinkWriteQueue = this.sinkWriteQueue.then(async () => {
+      try {
+        await action();
+      } catch (error) {
+        log.warn('sink write event error', error);
+      }
+    });
+  }
+
+  private async flushSinkWriteQueue(): Promise<void> {
+    await this.sinkWriteQueue;
   }
 
   async ensureInitialized(): Promise<InitializeResult> {
@@ -405,6 +464,7 @@ export class BindingRuntime {
   prompt(params: {
     runId: string;
     promptText: string;
+    promptResources?: Array<{ uri: string; mimeType?: string }>;
     sink: OutboundSink;
     uiMode: UiMode;
     contextText?: string;
@@ -419,6 +479,8 @@ export class BindingRuntime {
       this.currentUiMode = params.uiMode;
       this.currentActorUserId = params.actorUserId ?? null;
       this.activeSink = params.sink;
+      this.sinkWriteQueue = Promise.resolve();
+      this.summaryToolSeen = new Set<string>();
 
       try {
         const run = {
@@ -427,25 +489,43 @@ export class BindingRuntime {
           createdAtMs: Date.now(),
         };
 
-        const blocks = [] as Array<{ type: 'text'; text: string }>;
+        const blocks: ContentBlock[] = [];
 
         if (isFreshSession && params.contextText?.trim()) {
           blocks.push({ type: 'text', text: params.contextText });
         }
 
-        blocks.push({ type: 'text', text: params.promptText });
+        if (params.promptText.trim()) {
+          blocks.push({ type: 'text', text: params.promptText });
+        }
+
+        for (const [index, resource] of (params.promptResources ?? []).entries()) {
+          blocks.push({
+            type: 'resource_link',
+            uri: resource.uri,
+            name: deriveResourceName(resource.uri, index),
+            mimeType: resource.mimeType,
+          });
+        }
+
+        if (blocks.length === 0) {
+          blocks.push({ type: 'text', text: params.promptText });
+        }
 
         const result = await this.client.prompt(run, {
           sessionId,
           prompt: blocks,
         });
 
+        await this.flushSinkWriteQueue();
         return { stopReason: result.stopReason, lastSeq: this.currentRunLastSeq };
       } finally {
+        await this.flushSinkWriteQueue();
         this.activeSink = null;
         this.currentRunId = null;
         this.currentUiMode = 'verbose';
         this.currentActorUserId = null;
+        this.summaryToolSeen = new Set<string>();
       }
     });
 
@@ -463,6 +543,16 @@ export class BindingRuntime {
     if (!expected || expected === SHARED_CHAT_SCOPE_USER_ID) return true;
     if (!actorUserId) return true;
     return expected === actorUserId;
+  }
+
+  private selectSummaryToolTitle(rawTitle: string): string | null {
+    const normalized = normalizeSummaryToolTitle(rawTitle);
+    if (!normalized) return null;
+    const dedupeKey = normalized.toLowerCase();
+    if (this.summaryToolSeen.has(dedupeKey)) return null;
+    this.summaryToolSeen.add(dedupeKey);
+
+    return normalized;
   }
 }
 
@@ -500,5 +590,46 @@ function renderJson(value: unknown, maxChars: number): string {
     return text.slice(0, maxChars - 3) + '...';
   } catch {
     return String(value);
+  }
+}
+
+function normalizeSummaryToolTitle(title: string): string | null {
+  const trimmed = title.trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if (lowered === 'tool_call') return null;
+  if (lowered.startsWith('call_')) return null;
+  if (!/[a-z]/i.test(trimmed)) return null;
+
+  // Keep explicit tool method names when available.
+  const explicitMethod = trimmed.match(
+    /\b(fs\/[a-z0-9_/-]+|terminal\/[a-z0-9_/-]+|web\/[a-z0-9_/-]+|browser\/[a-z0-9_/-]+)\b/i,
+  )?.[1];
+  if (explicitMethod) return explicitMethod.toLowerCase();
+
+  // Collapse verbose natural-language titles into concise tool categories.
+  if (lowered.startsWith('run ')) return 'terminal/execute';
+  if (lowered.startsWith('read ')) return 'fs/read';
+  if (lowered.startsWith('write ') || lowered.startsWith('edit ')) return 'fs/write';
+  if (lowered.startsWith('list ')) return 'fs/list';
+  if (lowered.startsWith('search ')) return 'fs/search';
+  if (lowered.startsWith('fetch ') || lowered.includes('http')) return 'web/fetch';
+  if (lowered.includes('browser') || lowered.includes('navigate')) return 'browser/open';
+
+  return trimmed;
+}
+
+function deriveResourceName(uri: string, index: number): string {
+  const fallback = `attachment-${index + 1}`;
+  const trimmed = String(uri ?? '').trim();
+  if (!trimmed) return fallback;
+
+  try {
+    const parsed = new URL(trimmed);
+    const leaf = parsed.pathname.split('/').filter(Boolean).at(-1) ?? '';
+    const decoded = decodeURIComponent(leaf).trim();
+    return decoded || fallback;
+  } catch {
+    return fallback;
   }
 }

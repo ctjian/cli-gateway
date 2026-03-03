@@ -28,6 +28,9 @@ export type UiEvent =
     };
 
 export type OutboundSink = {
+  // Reserved for agent assistant content chunks.
+  // Telegram private chats stream this via sendMessageDraft.
+  sendAgentText?: (text: string) => Promise<void>;
   sendText: (text: string) => Promise<void>;
   flush?: () => Promise<void>;
   getDeliveryState?: () => DeliveryState;

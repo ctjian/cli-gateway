@@ -212,3 +212,104 @@ test('router non-command flow creates run/events/checkpoint and uses context rep
   router.close();
   db.close();
 });
+
+test('router forwards image resources as prompt resource_link blocks', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync('/tmp/cli-gateway-router-');
+
+  const key: ConversationKey = {
+    platform: 'telegram',
+    chatId: 'c',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const sessionKey = 's2';
+  createSession(db, {
+    sessionKey,
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: workspaceRoot,
+    loadSupported: false,
+  });
+  upsertBinding(db, key, sessionKey);
+
+  const rpc = new FakeRpc();
+  const router = new GatewayRouter({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot,
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'verbose',
+      uiJsonMaxChars: 10_000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    runtimeFactory: (p) =>
+      new BindingRuntime({
+        ...p,
+        acpRpc: rpc,
+        workspaceRoot,
+      }),
+  });
+
+  const state = { text: '', messageId: 'm2' as string | null };
+  const sink = {
+    sendText: async (t: string) => {
+      state.text += t;
+    },
+    flush: async () => {},
+    getDeliveryState: () => state,
+  };
+
+  await router.handleUserMessage(
+    key,
+    '',
+    sink as any,
+    {
+      resources: [
+        {
+          uri: 'https://cdn.example.com/a.png',
+          mimeType: 'image/png',
+        },
+      ],
+    },
+  );
+
+  assert.ok(state.text.includes('ok'));
+
+  const promptReq = rpc.written.find(
+    (m: any) => typeof m?.method === 'string' && m.method === 'session/prompt',
+  ) as any;
+  assert.ok(promptReq);
+
+  const blocks = promptReq.params.prompt as Array<any>;
+  assert.ok(
+    blocks.some(
+      (b) =>
+        b.type === 'resource_link' &&
+        b.uri === 'https://cdn.example.com/a.png' &&
+        b.name === 'a.png' &&
+        b.mimeType === 'image/png',
+    ),
+  );
+
+  router.close();
+  db.close();
+});

@@ -35,7 +35,7 @@ export type NewSessionResult = {
 
 export type ContentBlock =
   | { type: 'text'; text: string }
-  | { type: 'resource_link'; uri: string; mimeType?: string };
+  | { type: 'resource_link'; uri: string; name: string; mimeType?: string };
 
 export type PromptParams = {
   sessionId: string;

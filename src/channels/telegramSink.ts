@@ -2,24 +2,20 @@ import { InlineKeyboard, type Bot } from 'grammy';
 
 import type { OutboundSink } from '../gateway/router.js';
 import { createBufferedSink } from './bufferedSink.js';
-import { sendMessageDraft } from './telegramApi.js';
 
 export function createTelegramSink(
   bot: Bot,
-  token: string,
+  _token: string,
   chatId: number,
   threadId: number | null,
   userId: string,
   opts?: {
-    fetchFn?: typeof fetch;
-    draftId?: number;
-    draftIntervalMs?: number;
+    flushIntervalMs?: number;
   },
 ): OutboundSink & { flush: () => Promise<void> } {
-  // sendMessageDraft only supports private chats.
-  const useDraftStreaming = chatId > 0;
+  const isPrivateChat = chatId > 0;
 
-  if (!useDraftStreaming) {
+  if (!isPrivateChat) {
     const buffered = createBufferedSink({
       maxLen: 3800,
       flushIntervalMs: 700,
@@ -38,6 +34,7 @@ export function createTelegramSink(
     });
 
     return {
+      sendAgentText: buffered.sendText,
       sendText: buffered.sendText,
       flush: buffered.flush,
       getDeliveryState: buffered.getState,
@@ -61,7 +58,8 @@ export function createTelegramSink(
         });
       },
       sendUi: async (event) => {
-        const header = `<b>[${escapeHtml(event.kind)}]</b> ${escapeHtml(event.title)}`;
+        const safeTitle = truncate(event.title, 500);
+        const header = `<b>[${escapeHtml(event.kind)}]</b> ${escapeHtml(safeTitle)}`;
 
         if (event.detail && event.mode === 'verbose') {
           const code = escapeHtml(truncate(event.detail, 3200));
@@ -84,83 +82,45 @@ export function createTelegramSink(
     };
   }
 
-  // Draft streaming path.
-  const fetchFn = opts?.fetchFn ?? fetch;
-  const draftId = opts?.draftId ?? randomDraftId();
-  const draftIntervalMs = opts?.draftIntervalMs ?? 650;
-
-  let text = '';
-  let messageId: string | null = null;
-  let timer: NodeJS.Timeout | null = null;
-  let updating = false;
-  let draftEnabled = true;
-
-  async function updateDraft(): Promise<void> {
-    if (!draftEnabled) return;
-    if (updating) return;
-    if (!text) return;
-
-    updating = true;
-    try {
-      await sendMessageDraft(
-        token,
-        {
-          chatId,
-          threadId,
-          draftId,
-          text: truncate(text, 4096),
-        },
-        fetchFn,
-      );
-    } catch {
-      // If Bot API doesn't support it (or chat doesn't), fall back silently.
-      draftEnabled = false;
-    } finally {
-      updating = false;
-    }
-  }
-
-  function scheduleDraft(): void {
-    if (timer) return;
-    timer = setTimeout(() => {
-      timer = null;
-      void updateDraft().catch(() => {
-        // ignore
-      });
-    }, draftIntervalMs);
-  }
-
-  return {
-    sendText: async (delta: string) => {
-      if (!delta) return;
-      text += delta;
-      scheduleDraft();
-    },
-    flush: async () => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-
-      // Best-effort draft update; do not block final send.
-      try {
-        await updateDraft();
-      } catch {
-        // ignore
-      }
-
-      const finalText = truncate(text, 4096);
-      if (!finalText.trim()) return;
-
-      const msg = await bot.api.sendMessage(chatId, finalText, {
+  // Private chat path: stream assistant text by editing one message.
+  const agentBuffered = createBufferedSink({
+    maxLen: 3800,
+    flushIntervalMs: opts?.flushIntervalMs ?? 650,
+    send: async (text) => {
+      const msg = await bot.api.sendMessage(chatId, text, {
         message_thread_id: threadId ?? undefined,
       });
-      messageId = String(msg.message_id);
-
-      // Store what we actually sent.
-      text = finalText;
+      return { id: String(msg.message_id) };
     },
-    getDeliveryState: () => ({ text, messageId }),
+    edit: async (id, text) => {
+      await bot.api.editMessageText(chatId, Number(id), text, {
+        ...(threadId ? ({ message_thread_id: threadId } as any) : {}),
+      });
+    },
+  });
+  const summaryToolTitles = new Set<string>();
+
+  return {
+    sendAgentText: agentBuffered.sendText,
+    sendText: async (delta: string) => {
+      if (!delta.trim()) return;
+      await bot.api.sendMessage(chatId, truncate(delta, 4096), {
+        message_thread_id: threadId ?? undefined,
+      });
+    },
+    flush: async () => {
+      await agentBuffered.flush();
+
+      if (summaryToolTitles.size > 0) {
+        const toolLines = [...summaryToolTitles].map((title) => `- ${title}`).join('\n');
+        const toolSummary = truncate(`[tools]\n${toolLines}`, 4096);
+        await bot.api.sendMessage(chatId, toolSummary, {
+          message_thread_id: threadId ?? undefined,
+        });
+        summaryToolTitles.clear();
+      }
+    },
+    getDeliveryState: agentBuffered.getState,
     requestPermission: async (req) => {
       const allowData = `acpperm:${req.sessionKey}:${req.requestId}:allow`;
       const denyData = `acpperm:${req.sessionKey}:${req.requestId}:deny`;
@@ -181,7 +141,16 @@ export function createTelegramSink(
       });
     },
     sendUi: async (event) => {
-      const header = `<b>[${escapeHtml(event.kind)}]</b> ${escapeHtml(event.title)}`;
+      if (event.mode === 'summary' && event.kind === 'tool') {
+        const title = event.title.trim();
+        if (title) {
+          summaryToolTitles.add(truncate(title, 200));
+        }
+        return;
+      }
+
+      const safeTitle = truncate(event.title, 500);
+      const header = `<b>[${escapeHtml(event.kind)}]</b> ${escapeHtml(safeTitle)}`;
 
       if (event.detail && event.mode === 'verbose') {
         const code = escapeHtml(truncate(event.detail, 3200));
@@ -214,9 +183,4 @@ function escapeHtml(text: string): string {
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;');
-}
-
-function randomDraftId(): number {
-  // Must be non-zero.
-  return Math.floor(Math.random() * 2_000_000_000) + 1;
 }

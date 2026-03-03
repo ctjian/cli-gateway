@@ -21,19 +21,6 @@ function createFakeBot() {
   return { bot, calls };
 }
 
-function createFetchRecorder() {
-  const calls: any[] = [];
-
-  const fetchFn = async (url: any, init: any) => {
-    calls.push({ url: String(url), init });
-    return {
-      json: async () => ({ ok: true, result: true }),
-    } as any;
-  };
-
-  return { fetchFn, calls };
-}
-
 test('telegram sink renders permission with inline keyboard + HTML', async () => {
   const { bot, calls } = createFakeBot();
 
@@ -70,27 +57,13 @@ test('telegram sink renders UI events with HTML', async () => {
   assert.equal(call.args[2].parse_mode, 'HTML');
 });
 
-test('telegram sink streams drafts in private chat and sends final message on flush', async () => {
+test('telegram sink streams agent text in private chat and sends final message on flush', async () => {
   const { bot, calls } = createFakeBot();
-  const { fetchFn, calls: fetchCalls } = createFetchRecorder();
+  const sink = createTelegramSink(bot, 'token', 1, null, 'u1');
 
-  const sink = createTelegramSink(bot, 'token', 1, null, 'u1', {
-    fetchFn,
-    draftId: 123,
-    draftIntervalMs: 1,
-  });
-
-  await sink.sendText('a');
-  await sink.sendText('b');
+  await sink.sendAgentText!('a');
+  await sink.sendAgentText!('b');
   await sink.flush();
-
-  assert.ok(fetchCalls.some((c) => c.url.includes('/sendMessageDraft')));
-
-  const draftCall = fetchCalls.find((c) => c.url.includes('/sendMessageDraft'));
-  assert.ok(draftCall);
-  const body = JSON.parse(draftCall.init.body);
-  assert.equal(body.draft_id, 123);
-  assert.equal(body.chat_id, 1);
 
   assert.ok(calls.some((c) => c.method === 'sendMessage'));
   assert.ok(!calls.some((c) => c.method === 'editMessageText'));
@@ -100,20 +73,53 @@ test('telegram sink streams drafts in private chat and sends final message on fl
   assert.ok(state.messageId);
 });
 
-test('telegram sink draft timer updates without flush', async () => {
-  const { bot } = createFakeBot();
-  const { fetchFn, calls: fetchCalls } = createFetchRecorder();
+test('telegram sink private chat edits message for incremental agent text', async () => {
+  const { bot, calls } = createFakeBot();
 
   const sink = createTelegramSink(bot, 'token', 1, null, 'u1', {
-    fetchFn,
-    draftId: 123,
-    draftIntervalMs: 5,
+    flushIntervalMs: 5,
   });
 
-  await sink.sendText('x');
+  await sink.sendAgentText!('x');
   await new Promise((r) => setTimeout(r, 25));
+  await sink.sendAgentText!('y');
+  await new Promise((r) => setTimeout(r, 25));
+  await sink.flush();
 
-  assert.ok(fetchCalls.some((c) => c.url.includes('/sendMessageDraft')));
+  assert.ok(calls.some((c) => c.method === 'sendMessage'));
+  assert.ok(calls.some((c) => c.method === 'editMessageText'));
+});
+
+test('telegram sink private sendText uses standalone message path', async () => {
+  const { bot, calls } = createFakeBot();
+  const sink = createTelegramSink(bot, 'token', 1, null, 'u1');
+
+  await sink.sendText('[tool] terminal/create');
+  await sink.flush();
+
+  assert.ok(calls.some((c) => c.method === 'sendMessage'));
+});
+
+test('telegram sink buffers summary tool UI until final flush in private chat', async () => {
+  const { bot, calls } = createFakeBot();
+  const sink = createTelegramSink(bot, 'token', 1, null, 'u1');
+
+  await sink.sendUi!({
+    kind: 'tool',
+    mode: 'summary',
+    title: 'terminal/create',
+  });
+
+  assert.equal(calls.length, 0);
+
+  await sink.sendAgentText!('done');
+  await sink.flush();
+
+  const sentMessages = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(sentMessages.length, 2);
+  assert.equal(sentMessages[0].args[1], 'done');
+  assert.ok(String(sentMessages[1].args[1]).includes('[tools]'));
+  assert.ok(String(sentMessages[1].args[1]).includes('terminal/create'));
 });
 
 test('telegram sink falls back to send+edit in group chat', async () => {
