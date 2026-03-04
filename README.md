@@ -104,13 +104,14 @@ Feishu currently runs in webhook event-subscription mode:
 ## Chat commands (MVP)
 
 - `/help` show available commands
-- `/new` reset session binding
+- `/new` start a fresh ACP session for this conversation
 - `/allow <n>` select a pending permission option by index (fallback)
 - `/deny` reject a pending permission request (fallback)
 - `/cron help|list|add|del|enable|disable` manage scheduled prompts
 - `/last` show last run output for this session
 - `/replay [runId]` replay stored `session/update` output for a run (best-effort)
 - `/ui verbose|summary` set UI verbosity for this conversation
+- `/cli show|codex|claude` show/switch ACP CLI preset for this conversation
 - `/workspace show|~|~/...|/abs/path` show/set per-conversation workspace root (alias: `/ws`)
 - `/help` also includes ACP `available_commands_update` entries as `cli-inline` commands (best-effort)
 
@@ -118,7 +119,7 @@ Telegram note:
 - Chat-scoped command menu is synced best-effort from `cli-inline` commands. Commands with `-` are mapped to `_` in Telegram UI.
 
 Discord note:
-- Built-in commands are available as slash commands (`/help`, `/ui`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/cron`).
+- Built-in commands are available as slash commands (`/help`, `/ui`, `/cli`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/cron`).
 - Slash commands are synced at startup (global + per-guild best-effort). Global command propagation may take time on Discord side.
 - ACP `cli-inline` dynamic commands are not yet exposed as Discord slash commands.
 
@@ -146,6 +147,7 @@ Tool-call UI is lifecycle-based (`started`/`running`/`completed`) and updates by
   - Private chat: isolated per user
   - Group/supergroup/topic: isolated per chat (and topic thread when present)
 - Workspace root (`/workspace`) and run history follow the same binding scope.
+- `/new` starts a fresh ACP session but keeps conversation-scoped preferences (UI mode, workspace root, CLI preset, permission policies).
 
 ## Memory (context replay)
 

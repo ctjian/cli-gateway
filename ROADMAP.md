@@ -34,12 +34,13 @@ This document lists current gaps (vs a "production gateway") and the planned dir
 - Context replay (DB-backed) for fresh ACP sessions.
 - Delivery checkpoints table + `/replay` command (best-effort).
 - Interactive permission buttons on Discord/Telegram (Allow/Deny).
-- Discord built-in slash command registration + handling (`/help`, `/ui`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/cron`).
+- Discord built-in slash command registration + handling (`/help`, `/ui`, `/cli`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/cron`).
 - Process guard script for auto-restart on abnormal exit (`scripts/run-guard.sh`).
 - Feishu inbound webhook + outbound send (MVP).
 - First-run interactive config wizard (TTY) + lock directory bootstrap.
 - Default UI mode switched to `summary` (conversation-level `/ui` override still supported).
 - Tool-call UI now tracks lifecycle (`start`/`update`/`complete`) keyed by tool-call id to reduce duplicate tool messages.
+- Conversation preferences can now be changed before first prompt (`/ui`, `/workspace`, `/cli`) and survive `/new` session reset.
 
 ## Suggested Next Steps (Priority)
 

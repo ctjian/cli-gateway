@@ -29,6 +29,7 @@ test('buildDiscordSlashCommands includes base command names', () => {
 
   assert.deepEqual(names, [
     'allow',
+    'cli',
     'cron',
     'deny',
     'help',
@@ -88,6 +89,26 @@ test('mapDiscordSlashToRouterCommand maps optional args', () => {
       }),
     ),
     '/workspace show',
+  );
+
+  assert.equal(
+    mapDiscordSlashToRouterCommand(
+      makeInteraction({
+        commandName: 'cli',
+        strings: { preset: 'claude' },
+      }),
+    ),
+    '/cli claude',
+  );
+
+  assert.equal(
+    mapDiscordSlashToRouterCommand(
+      makeInteraction({
+        commandName: 'cli',
+        strings: { preset: null },
+      }),
+    ),
+    '/cli show',
   );
 
   assert.equal(

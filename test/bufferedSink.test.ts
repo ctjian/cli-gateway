@@ -34,7 +34,6 @@ test('buffered sink sends then edits', async () => {
   assert.equal(edits[0].text, 'hello world');
 });
 
-
 test('buffered sink background flush runs on timer', async () => {
   const sent: string[] = [];
 
@@ -98,4 +97,29 @@ test('buffered sink falls back to send if edit fails', async () => {
   assert.equal(sent.length, 2);
   assert.equal(sent[0], 'a');
   assert.equal(sent[1], 'ab');
+});
+
+test('buffered sink ignores no-op edit errors and avoids duplicate send', async () => {
+  const sent: string[] = [];
+
+  const sink = createBufferedSink({
+    maxLen: 100,
+    flushIntervalMs: 1000,
+    send: async (text) => {
+      sent.push(text);
+      return { id: String(sent.length) };
+    },
+    edit: async () => {
+      throw new Error('Bad Request: message is not modified');
+    },
+  });
+
+  await sink.sendText('hello');
+  await sink.flush();
+
+  // Explicit final flush should not create a duplicate message.
+  await sink.flush();
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0], 'hello');
 });

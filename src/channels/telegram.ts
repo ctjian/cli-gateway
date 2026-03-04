@@ -54,6 +54,7 @@ export async function startTelegram(
   const tgCommands = [
     { command: 'help', description: 'Show commands' },
     { command: 'ui', description: 'Set UI mode (verbose/summary)' },
+    { command: 'cli', description: 'Show/switch ACP CLI preset' },
     { command: 'workspace', description: 'Show/set workspace' },
     { command: 'cron', description: 'Manage scheduler jobs' },
     { command: 'new', description: 'Reset conversation session' },

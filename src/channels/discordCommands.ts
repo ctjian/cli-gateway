@@ -46,6 +46,21 @@ export function buildDiscordSlashCommands(): RESTPostAPIChatInputApplicationComm
       ),
 
     new SlashCommandBuilder()
+      .setName('cli')
+      .setDescription('Show or switch ACP CLI preset')
+      .addStringOption((opt) =>
+        opt
+          .setName('preset')
+          .setDescription('show, codex, or claude')
+          .setRequired(false)
+          .addChoices(
+            { name: 'show', value: 'show' },
+            { name: 'codex', value: 'codex' },
+            { name: 'claude', value: 'claude' },
+          ),
+      ),
+
+    new SlashCommandBuilder()
       .setName('workspace')
       .setDescription('Show or set workspace root')
       .addStringOption((opt) =>
@@ -152,6 +167,10 @@ export function mapDiscordSlashToRouterCommand(
     case 'ui': {
       const mode = interaction.options.getString('mode');
       return mode ? `/ui ${mode}` : '/ui';
+    }
+    case 'cli': {
+      const preset = interaction.options.getString('preset');
+      return preset ? `/cli ${preset}` : '/cli show';
     }
     case 'workspace': {
       const raw = interaction.options.getString('path');

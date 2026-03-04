@@ -35,7 +35,10 @@ export function createBufferedSink(params: {
 
       try {
         await params.edit(currentMessageId, truncate(currentText, params.maxLen));
-      } catch {
+      } catch (error) {
+        if (isNoopEditError(error)) {
+          return;
+        }
         const res = await params.send(truncate(currentText, params.maxLen));
         currentMessageId = res.id;
       }
@@ -83,4 +86,20 @@ export function createBufferedSink(params: {
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   return text.slice(0, maxLen - 3) + '...';
+}
+
+function isNoopEditError(error: unknown): boolean {
+  const message =
+    typeof error === 'string'
+      ? error
+      : error && typeof error === 'object' && 'message' in error
+        ? String((error as { message?: unknown }).message ?? '')
+        : '';
+  const lowered = message.toLowerCase();
+
+  return (
+    lowered.includes('message is not modified') ||
+    lowered.includes('message not modified') ||
+    lowered.includes('content must be different')
+  );
 }

@@ -406,6 +406,109 @@ class UiFlushRpc implements StdioProcess {
   }
 }
 
+class ActionSummaryRpc implements StdioProcess {
+  private messageHandlers: Array<(m: JsonRpcMessage) => void> = [];
+  private promptRequestId: number | null = null;
+  private sessionId = 'sess-actions';
+
+  write(message: JsonRpcMessage): void {
+    if (!('method' in message)) return;
+    const req = message as JsonRpcRequest;
+
+    if (req.method === 'initialize') {
+      queueMicrotask(() => {
+        this.emit({
+          jsonrpc: '2.0',
+          id: req.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: false },
+          },
+        } as JsonRpcResponse);
+      });
+      return;
+    }
+
+    if (req.method === 'session/new') {
+      queueMicrotask(() => {
+        this.emit({
+          jsonrpc: '2.0',
+          id: req.id,
+          result: { sessionId: this.sessionId },
+        } as JsonRpcResponse);
+      });
+      return;
+    }
+
+    if (req.method === 'session/prompt') {
+      this.promptRequestId = Number(req.id);
+      queueMicrotask(() => {
+        this.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'action-1',
+              title: 'Run npm test, Read src/main.ts, Edit src/main.ts',
+              status: 'in_progress',
+              kind: 'execute',
+            },
+          },
+        } as any);
+
+        this.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'action-1',
+              status: 'completed',
+            },
+          },
+        } as any);
+
+        this.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'done' },
+            },
+          },
+        } as any);
+
+        this.emit({
+          jsonrpc: '2.0',
+          id: this.promptRequestId!,
+          result: { stopReason: 'end' },
+        } as JsonRpcResponse);
+      });
+    }
+  }
+
+  onMessage(cb: (message: JsonRpcMessage) => void): void {
+    this.messageHandlers.push(cb);
+  }
+
+  onStderr(): void {
+    // noop
+  }
+
+  kill(): void {
+    // noop
+  }
+
+  private emit(message: JsonRpcMessage): void {
+    this.messageHandlers.forEach((h) => h(message));
+  }
+}
+
 test('BindingRuntime prompt emits plan/tool UI and supports interactive permission', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
@@ -722,6 +825,184 @@ test('BindingRuntime prompt waits for pending summary tool UI delivery', async (
     uiEvents.filter((e) => e.kind === 'tool').map((e) => e.title),
     ['terminal/create · started', 'terminal/create · completed'],
   );
+
+  rt.close();
+  db.close();
+});
+
+test('BindingRuntime summary renders actionable tool titles', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync('/tmp/cli-gateway-test-');
+  const key: ConversationKey = {
+    platform: 'telegram',
+    chatId: 'c',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const sessionKey = 's4';
+  createSession(db, {
+    sessionKey,
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: workspaceRoot,
+    loadSupported: false,
+  });
+
+  const bindingKey = upsertBinding(db, key, sessionKey).bindingKey;
+  const toolAuth = new ToolAuth(db);
+
+  const rt = new BindingRuntime({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot,
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'summary',
+      uiJsonMaxChars: 10_000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    toolAuth,
+    sessionKey,
+    bindingKey,
+    acpRpc: new ActionSummaryRpc(),
+    workspaceRoot,
+  });
+
+  const uiEvents: UiEvent[] = [];
+  const chunks: string[] = [];
+  const sink: OutboundSink = {
+    sendText: async (text) => {
+      chunks.push(text);
+    },
+    sendUi: async (event) => {
+      uiEvents.push(event);
+    },
+  };
+
+  createRun(db, { runId: 'r4', sessionKey, promptText: 'go' });
+
+  const out = await rt.prompt({
+    runId: 'r4',
+    promptText: 'go',
+    sink,
+    uiMode: 'summary',
+  });
+
+  assert.equal(out.stopReason, 'end');
+  assert.ok(chunks.join('').includes('done'));
+
+  const toolTitles = uiEvents
+    .filter((event) => event.kind === 'tool')
+    .map((event) => event.title);
+
+  assert.deepEqual(toolTitles, [
+    'run: npm test (+2 more) · started',
+    'run: npm test (+2 more) · completed',
+  ]);
+
+  rt.close();
+  db.close();
+});
+
+test('BindingRuntime verbose tool details include action breakdown', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync('/tmp/cli-gateway-test-');
+  const key: ConversationKey = {
+    platform: 'telegram',
+    chatId: 'c',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const sessionKey = 's5';
+  createSession(db, {
+    sessionKey,
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: workspaceRoot,
+    loadSupported: false,
+  });
+
+  const bindingKey = upsertBinding(db, key, sessionKey).bindingKey;
+  const toolAuth = new ToolAuth(db);
+
+  const rt = new BindingRuntime({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot,
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'verbose',
+      uiJsonMaxChars: 10_000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    toolAuth,
+    sessionKey,
+    bindingKey,
+    acpRpc: new ActionSummaryRpc(),
+    workspaceRoot,
+  });
+
+  const uiEvents: UiEvent[] = [];
+  const sink: OutboundSink = {
+    sendText: async () => {
+      // noop
+    },
+    sendUi: async (event) => {
+      uiEvents.push(event);
+    },
+  };
+
+  createRun(db, { runId: 'r5', sessionKey, promptText: 'go' });
+
+  const out = await rt.prompt({
+    runId: 'r5',
+    promptText: 'go',
+    sink,
+    uiMode: 'verbose',
+  });
+
+  assert.equal(out.stopReason, 'end');
+
+  const firstTool = uiEvents.find((event) => event.kind === 'tool');
+  assert.ok(firstTool);
+  assert.ok(firstTool?.detail?.includes('actions:'));
+  assert.ok(firstTool?.detail?.includes('1. run: npm test'));
+  assert.ok(firstTool?.detail?.includes('2. read: src/main.ts'));
+  assert.ok(firstTool?.detail?.includes('3. edit: src/main.ts'));
 
   rt.close();
   db.close();

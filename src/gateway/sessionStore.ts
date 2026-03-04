@@ -147,6 +147,32 @@ export function updateSessionCwd(db: Db, sessionKey: string, cwd: string): void 
   );
 }
 
+export function updateSessionAgentConfig(
+  db: Db,
+  params: {
+    sessionKey: string;
+    agentCommand: string;
+    agentArgs: string[];
+  },
+): void {
+  const now = Date.now();
+  db.prepare(
+    `
+    UPDATE sessions
+       SET agent_command = ?,
+           agent_args_json = ?,
+           acp_session_id = NULL,
+           updated_at = ?
+     WHERE session_key = ?
+    `,
+  ).run(
+    params.agentCommand,
+    JSON.stringify(params.agentArgs),
+    now,
+    params.sessionKey,
+  );
+}
+
 export function getSession(
   db: Db,
   sessionKey: string,

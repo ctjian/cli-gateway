@@ -10,11 +10,11 @@ import {
   bindingKeyFromConversationKey,
   createRun,
   createSession,
-  deleteBinding,
   finishRun,
   getBinding,
   getSession,
   SHARED_CHAT_SCOPE_USER_ID,
+  updateSessionAgentConfig,
   updateSessionCwd,
   upsertBinding,
   type ConversationKey,
@@ -50,6 +50,30 @@ export type UserMessageOptions = {
   resources?: UserResource[];
 };
 
+type CliPresetId = 'codex' | 'claude';
+
+type CliPreset = {
+  id: CliPresetId;
+  label: string;
+  agentCommand: string;
+  agentArgs: string[];
+};
+
+const CLI_PRESETS: Record<CliPresetId, CliPreset> = {
+  codex: {
+    id: 'codex',
+    label: 'Codex',
+    agentCommand: 'npx',
+    agentArgs: ['-y', '@zed-industries/codex-acp@latest'],
+  },
+  claude: {
+    id: 'claude',
+    label: 'Claude Code',
+    agentCommand: 'npx',
+    agentArgs: ['-y', '@anthropic-ai/claude-code-acp@latest'],
+  },
+};
+
 export class GatewayRouter {
   private readonly db: Db;
   private readonly config: AppConfig;
@@ -62,6 +86,8 @@ export class GatewayRouter {
     sessionKey: string;
     bindingKey: string;
     workspaceRoot: string;
+    agentCommand: string;
+    agentArgs: string[];
   }) => BindingRuntime;
 
   private readonly runtimesBySessionKey = new Map<
@@ -82,6 +108,8 @@ export class GatewayRouter {
       sessionKey: string;
       bindingKey: string;
       workspaceRoot: string;
+      agentCommand: string;
+      agentArgs: string[];
     }) => BindingRuntime;
   }) {
     this.db = params.db;
@@ -154,6 +182,11 @@ export class GatewayRouter {
       throw new Error(`Missing session row: ${params.sessionKey}`);
     }
 
+    const agentArgs = parseSessionAgentArgs(
+      sess.agentArgsJson,
+      this.config.acpAgentArgs,
+    );
+
     const rt = this.runtimeFactory
       ? this.runtimeFactory({
           db: this.db,
@@ -162,6 +195,8 @@ export class GatewayRouter {
           sessionKey: params.sessionKey,
           bindingKey: params.bindingKey,
           workspaceRoot: sess.cwd,
+          agentCommand: sess.agentCommand,
+          agentArgs,
         })
       : new BindingRuntime({
           db: this.db,
@@ -170,6 +205,8 @@ export class GatewayRouter {
           sessionKey: params.sessionKey,
           bindingKey: params.bindingKey,
           workspaceRoot: sess.cwd,
+          agentCommand: sess.agentCommand,
+          agentArgs,
         });
 
     this.runtimesBySessionKey.set(params.sessionKey, {
@@ -317,6 +354,7 @@ export class GatewayRouter {
             'Commands:',
             '/help',
             '/ui verbose|summary',
+            '/cli show|codex|claude',
             '/workspace show|<absolute-path>',
             '/new',
             '/last',
@@ -331,17 +369,34 @@ export class GatewayRouter {
       }
 
       case '/new': {
-        const existing = getBinding(this.db, key);
-        if (existing) {
-          const entry = this.runtimesBySessionKey.get(existing.sessionKey);
+        const binding = getBinding(this.db, key);
+        const previousSession = binding
+          ? getSession(this.db, binding.sessionKey)
+          : null;
+
+        if (binding) {
+          const entry = this.runtimesBySessionKey.get(binding.sessionKey);
           entry?.runtime.close();
-          this.runtimesBySessionKey.delete(existing.sessionKey);
+          this.runtimesBySessionKey.delete(binding.sessionKey);
         }
 
-        deleteBinding(this.db, key);
-        await sink.sendText(
-          'OK: binding cleared. Next message creates a new session.',
-        );
+        const nextSessionKey = randomUUID();
+        createSession(this.db, {
+          sessionKey: nextSessionKey,
+          agentCommand:
+            previousSession?.agentCommand ?? this.config.acpAgentCommand,
+          agentArgs: previousSession
+            ? parseSessionAgentArgs(
+                previousSession.agentArgsJson,
+                this.config.acpAgentArgs,
+              )
+            : this.config.acpAgentArgs,
+          cwd: previousSession?.cwd ?? this.config.workspaceRoot,
+          loadSupported: false,
+        });
+        upsertBinding(this.db, key, nextSessionKey);
+
+        await sink.sendText('OK: started a new session for this conversation.');
         return true;
       }
 
@@ -395,13 +450,7 @@ export class GatewayRouter {
       }
 
       case '/ui': {
-        const binding = getBinding(this.db, key);
-        if (!binding) {
-          await sink.sendText('No session binding. Send a message first.');
-          return true;
-        }
-
-        const bindingKey = bindingKeyFromConversationKey(key);
+        const { bindingKey } = this.ensureBindingExists(key);
         const arg = (parts[1] ?? '').toLowerCase();
 
         const current =
@@ -422,16 +471,72 @@ export class GatewayRouter {
         return true;
       }
 
-      case '/workspace':
-      case '/ws': {
-        const binding = getBinding(this.db, key);
-        if (!binding) {
-          await sink.sendText('No session binding. Send a message first.');
+      case '/cli': {
+        const { sessionKey } = this.ensureBindingExists(key);
+        const sess = getSession(this.db, sessionKey);
+        if (!sess) {
+          await sink.sendText('Missing session row.');
           return true;
         }
 
+        const argRaw = (parts[1] ?? 'show').toLowerCase();
+        const selection = parseCliPresetArg(argRaw);
+        if (!selection) {
+          await sink.sendText('Usage: /cli show|codex|claude');
+          return true;
+        }
+
+        const currentArgs = parseSessionAgentArgs(
+          sess.agentArgsJson,
+          this.config.acpAgentArgs,
+        );
+        const currentPreset = detectCliPreset(sess.agentCommand, currentArgs);
+
+        if (selection === 'show') {
+          const label = currentPreset
+            ? CLI_PRESETS[currentPreset].label
+            : 'Custom';
+          await sink.sendText(
+            `CLI: ${label} (${formatAgentSpec(sess.agentCommand, currentArgs)})`,
+          );
+          return true;
+        }
+
+        const target = CLI_PRESETS[selection];
+        const unchanged =
+          sess.agentCommand === target.agentCommand &&
+          sameArgs(currentArgs, target.agentArgs);
+        if (unchanged) {
+          await sink.sendText(
+            `CLI unchanged: ${target.label} (${formatAgentSpec(target.agentCommand, target.agentArgs)})`,
+          );
+          return true;
+        }
+
+        updateSessionAgentConfig(this.db, {
+          sessionKey,
+          agentCommand: target.agentCommand,
+          agentArgs: target.agentArgs,
+        });
+
+        const entry = this.runtimesBySessionKey.get(sessionKey);
+        if (entry) {
+          entry.runtime.close();
+          this.runtimesBySessionKey.delete(sessionKey);
+        }
+
+        await sink.sendText(
+          `OK: CLI switched to ${target.label} (${formatAgentSpec(target.agentCommand, target.agentArgs)}).`,
+        );
+        return true;
+      }
+
+      case '/workspace':
+      case '/ws': {
+        const { sessionKey } = this.ensureBindingExists(key);
+
         const arg = parts.slice(1).join(' ').trim();
-        const sess = getSession(this.db, binding.sessionKey);
+        const sess = getSession(this.db, sessionKey);
         if (!sess) {
           await sink.sendText('Missing session row.');
           return true;
@@ -450,12 +555,12 @@ export class GatewayRouter {
           return true;
         }
 
-        updateSessionCwd(this.db, binding.sessionKey, nextCwd);
+        updateSessionCwd(this.db, sessionKey, nextCwd);
 
-        const entry = this.runtimesBySessionKey.get(binding.sessionKey);
+        const entry = this.runtimesBySessionKey.get(sessionKey);
         if (entry) {
           entry.runtime.close();
-          this.runtimesBySessionKey.delete(binding.sessionKey);
+          this.runtimesBySessionKey.delete(sessionKey);
         }
 
         await sink.sendText(`OK: workspace set to ${nextCwd}`);
@@ -738,9 +843,7 @@ export class GatewayRouter {
 
       const result = await rt.prompt({
         runId,
-        promptText:
-          normalizedText ||
-          (resources.length > 0 ? 'User sent image attachment(s).' : text),
+        promptText: normalizedText || text,
         promptResources: resources,
         sink,
         uiMode,
@@ -826,6 +929,60 @@ export class GatewayRouter {
       return [];
     }
   }
+}
+
+function parseSessionAgentArgs(raw: string, fallback: string[]): string[] {
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      Array.isArray(parsed) &&
+      parsed.every((item) => typeof item === 'string')
+    ) {
+      return parsed;
+    }
+  } catch {
+    // ignore invalid persisted JSON
+  }
+  return [...fallback];
+}
+
+function parseCliPresetArg(raw: string): CliPresetId | 'show' | null {
+  const value = raw.trim().toLowerCase();
+  if (!value || value === 'show') return 'show';
+  if (value === 'codex') return 'codex';
+  if (value === 'claude' || value === 'claude-code' || value === 'claude_code') {
+    return 'claude';
+  }
+  return null;
+}
+
+function detectCliPreset(command: string, args: string[]): CliPresetId | null {
+  for (const preset of Object.values(CLI_PRESETS)) {
+    if (command !== preset.agentCommand) continue;
+    if (!sameArgs(args, preset.agentArgs)) continue;
+    return preset.id;
+  }
+  return null;
+}
+
+function sameArgs(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function formatAgentSpec(command: string, args: string[]): string {
+  const quotedArgs = args.map((item) => quoteArg(item));
+  const parts = [quoteArg(command), ...quotedArgs].filter(Boolean);
+  return parts.join(' ');
+}
+
+function quoteArg(text: string): string {
+  if (!text) return '""';
+  if (!/[\s"'`$\\]/.test(text)) return text;
+  return JSON.stringify(text);
 }
 
 function renderSessionUpdateDelta(update: any): string {

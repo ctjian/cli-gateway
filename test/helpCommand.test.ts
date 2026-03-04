@@ -58,6 +58,7 @@ test('/help prints command list without requiring binding', async () => {
   const text = out.join('\n');
   assert.ok(text.includes('Commands:'));
   assert.ok(text.includes('/ui'));
+  assert.ok(text.includes('/cli'));
   assert.ok(text.includes('/workspace'));
 
   router.close();

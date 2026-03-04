@@ -101,6 +101,38 @@ test('/workspace show and set updates session cwd and closes runtime', async () 
   router.close();
 });
 
+test('/workspace works without an existing binding', async () => {
+  const db = createDb();
+  const router = new GatewayRouter({ db, config: createConfig() as any });
+
+  const key: ConversationKey = {
+    platform: 'discord',
+    chatId: 'c',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const texts: string[] = [];
+  const sink = { sendText: async (t: string) => texts.push(t) };
+
+  await router.handleUserMessage(key, '/workspace show', sink as any);
+  assert.ok(String(texts.at(-1)).startsWith('Workspace: '));
+
+  const next = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-gateway-ws-'));
+  texts.length = 0;
+  await router.handleUserMessage(key, `/workspace ${next}`, sink as any);
+  assert.equal(texts.at(-1), `OK: workspace set to ${next}`);
+
+  const row = db
+    .prepare(
+      'SELECT s.cwd as cwd FROM sessions s JOIN bindings b ON b.session_key = s.session_key LIMIT 1',
+    )
+    .get() as { cwd: string };
+  assert.equal(row.cwd, next);
+
+  router.close();
+});
+
 test('/workspace rejects invalid paths without crashing', async () => {
   const db = createDb();
   const router = new GatewayRouter({ db, config: createConfig() as any });

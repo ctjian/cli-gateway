@@ -37,6 +37,8 @@ export class BindingRuntime {
   private toolCallTitles = new Map<string, string>();
 
   private readonly workspaceRoot: string;
+  private readonly agentCommand: string;
+  private readonly agentArgs: string[];
 
   constructor(params: {
     db: Db;
@@ -45,6 +47,8 @@ export class BindingRuntime {
     sessionKey: string;
     bindingKey: string;
     workspaceRoot: string;
+    agentCommand?: string;
+    agentArgs?: string[];
     acpRpc?: import('../acp/stdio.js').StdioProcess;
   }) {
     this.db = params.db;
@@ -53,12 +57,14 @@ export class BindingRuntime {
     this.sessionKey = params.sessionKey;
     this.bindingKey = params.bindingKey;
     this.workspaceRoot = params.workspaceRoot;
+    this.agentCommand = params.agentCommand ?? this.config.acpAgentCommand;
+    this.agentArgs = params.agentArgs ?? this.config.acpAgentArgs;
 
     this.client = new AcpClient({
       db: this.db,
       workspaceRoot: this.workspaceRoot,
-      agentCommand: this.config.acpAgentCommand,
-      agentArgs: this.config.acpAgentArgs,
+      agentCommand: this.agentCommand,
+      agentArgs: this.agentArgs,
       toolAuth: this.toolAuth,
       rpc: params.acpRpc,
       events: {
@@ -93,7 +99,7 @@ export class BindingRuntime {
 
               const detail =
                 this.currentUiMode === 'verbose'
-                  ? renderJson(update, this.config.uiJsonMaxChars)
+                  ? ui.detail ?? renderJson(update, this.config.uiJsonMaxChars)
                   : undefined;
 
               if (!sink.sendUi && this.currentUiMode === 'summary') {
@@ -508,16 +514,24 @@ export class BindingRuntime {
 
   private buildToolUiEvent(
     update: any,
-  ): { title: string; toolCallId?: string; stage: ToolUiStage; status: string } | null {
+  ): {
+    title: string;
+    detail?: string;
+    toolCallId?: string;
+    stage: ToolUiStage;
+    status: string;
+  } | null {
     const stage = inferToolStage(update);
     const status = toolStatusLabel(stage, update);
     const toolCallId = extractToolCallId(update) ?? undefined;
 
-    const rawTitle = String(update?.title ?? toolCallId ?? 'tool_call');
+    const rawTitle = String(update?.title ?? toolCallId ?? 'tool_call').trim();
+    const inferredActions = inferToolActions(update, rawTitle);
+
     let baseTitle =
       this.currentUiMode === 'summary'
-        ? normalizeSummaryToolTitle(rawTitle)
-        : rawTitle.trim() || 'tool_call';
+        ? normalizeSummaryToolTitle(rawTitle, inferredActions)
+        : normalizeVerboseToolTitle(rawTitle, inferredActions);
     if (!baseTitle) return null;
 
     if (toolCallId) {
@@ -529,8 +543,20 @@ export class BindingRuntime {
       }
     }
 
+    const detail =
+      this.currentUiMode === 'verbose'
+        ? buildToolDetailText({
+            update,
+            rawTitle,
+            inferredActions,
+            toolCallId,
+            status,
+          })
+        : undefined;
+
     return {
       title: `${baseTitle} · ${status}`,
+      detail,
       toolCallId,
       stage,
       status,
@@ -575,7 +601,13 @@ function renderJson(value: unknown, maxChars: number): string {
   }
 }
 
-function normalizeSummaryToolTitle(title: string): string | null {
+function normalizeSummaryToolTitle(
+  title: string,
+  inferredActions: ToolAction[],
+): string | null {
+  const inferredTitle = summarizeInferredActions(inferredActions, 86);
+  if (inferredTitle) return inferredTitle;
+
   const trimmed = title.trim();
   if (!trimmed) return null;
   const lowered = trimmed.toLowerCase();
@@ -589,16 +621,18 @@ function normalizeSummaryToolTitle(title: string): string | null {
   )?.[1];
   if (explicitMethod) return explicitMethod.toLowerCase();
 
-  // Collapse verbose natural-language titles into concise tool categories.
-  if (lowered.startsWith('run ')) return 'terminal/execute';
-  if (lowered.startsWith('read ')) return 'fs/read';
-  if (lowered.startsWith('write ') || lowered.startsWith('edit ')) return 'fs/write';
-  if (lowered.startsWith('list ')) return 'fs/list';
-  if (lowered.startsWith('search ')) return 'fs/search';
-  if (lowered.startsWith('fetch ') || lowered.includes('http')) return 'web/fetch';
-  if (lowered.includes('browser') || lowered.includes('navigate')) return 'browser/open';
-
   return trimmed;
+}
+
+function normalizeVerboseToolTitle(
+  title: string,
+  inferredActions: ToolAction[],
+): string {
+  const inferredTitle = summarizeInferredActions(inferredActions, 96);
+  if (inferredTitle) return inferredTitle;
+
+  const trimmed = title.trim();
+  return trimmed || 'tool_call';
 }
 
 function inferToolStage(update: any): ToolUiStage {
@@ -686,4 +720,282 @@ function deriveResourceName(uri: string, index: number): string {
   } catch {
     return fallback;
   }
+}
+
+type ToolActionVerb =
+  | 'run'
+  | 'read'
+  | 'edit'
+  | 'list'
+  | 'search'
+  | 'fetch'
+  | 'move'
+  | 'delete'
+  | 'unknown';
+
+type ToolAction = {
+  verb: ToolActionVerb;
+  target: string;
+};
+
+function inferToolActions(update: any, rawTitle: string): ToolAction[] {
+  const fromTitle = parseToolActionsFromTitle(rawTitle);
+  if (fromTitle.length > 0) return fromTitle;
+
+  const kind = String(update?.kind ?? '').trim().toLowerCase();
+  if (!kind) return [];
+
+  const command = extractCommandHint(update);
+  const path = extractPathHint(update);
+  const query = extractSearchHint(update);
+  const target = path ?? query ?? command ?? '';
+
+  if (kind === 'execute' && command) {
+    return [{ verb: 'run', target: command }];
+  }
+  if (kind === 'read' && target) {
+    return [{ verb: 'read', target }];
+  }
+  if (kind === 'edit' && target) {
+    return [{ verb: 'edit', target }];
+  }
+  if (kind === 'search' && target) {
+    return [{ verb: 'search', target }];
+  }
+  if (kind === 'fetch' && target) {
+    return [{ verb: 'fetch', target }];
+  }
+  if (kind === 'move' && target) {
+    return [{ verb: 'move', target }];
+  }
+  if (kind === 'delete' && target) {
+    return [{ verb: 'delete', target }];
+  }
+
+  return [];
+}
+
+function parseToolActionsFromTitle(title: string): ToolAction[] {
+  const trimmed = title.trim();
+  if (!trimmed) return [];
+
+  const parts = splitToolTitleParts(trimmed);
+  if (parts.length > 1) {
+    const parsed = parts.map((part) => parseToolActionPart(part));
+    if (parsed.every(Boolean)) return parsed as ToolAction[];
+  }
+
+  const one = parseToolActionPart(trimmed);
+  return one ? [one] : [];
+}
+
+function splitToolTitleParts(title: string): string[] {
+  if (!title.includes(',')) return [title];
+  return title
+    .split(/\s*,\s*/g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function parseToolActionPart(text: string): ToolAction | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const patterns: Array<[RegExp, ToolActionVerb]> = [
+    [/^(?:run|execute)\s+(.+)$/i, 'run'],
+    [/^(?:read|view)\s+(.+)$/i, 'read'],
+    [/^(?:write|edit|modify|update)\s+(.+)$/i, 'edit'],
+    [/^(?:list)\s+(.+)$/i, 'list'],
+    [/^(?:search|find|grep)\s+(.+)$/i, 'search'],
+    [/^(?:fetch|download|request)\s+(.+)$/i, 'fetch'],
+    [/^(?:move|rename)\s+(.+)$/i, 'move'],
+    [/^(?:delete|remove|rm)\s+(.+)$/i, 'delete'],
+  ];
+
+  for (const [pattern, verb] of patterns) {
+    const match = trimmed.match(pattern);
+    if (!match) continue;
+    const target = match[1]?.trim();
+    if (!target) return null;
+    return { verb, target };
+  }
+
+  return null;
+}
+
+function summarizeInferredActions(
+  actions: ToolAction[],
+  targetMaxLen: number,
+): string | null {
+  if (actions.length === 0) return null;
+
+  const first = formatToolAction(actions[0], targetMaxLen);
+  if (actions.length === 1) return first;
+
+  return `${first} (+${actions.length - 1} more)`;
+}
+
+function formatToolAction(action: ToolAction, targetMaxLen: number): string {
+  return `${action.verb}: ${truncateInline(action.target, targetMaxLen)}`;
+}
+
+function truncateInline(text: string, maxLen: number): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= maxLen) return clean;
+  return clean.slice(0, maxLen - 3) + '...';
+}
+
+function buildToolDetailText(params: {
+  update: any;
+  rawTitle: string;
+  inferredActions: ToolAction[];
+  toolCallId?: string;
+  status: string;
+}): string | undefined {
+  const lines: string[] = [];
+
+  if (params.inferredActions.length > 0) {
+    lines.push('actions:');
+    params.inferredActions.forEach((action, index) => {
+      lines.push(`${index + 1}. ${formatToolAction(action, 180)}`);
+    });
+  } else if (params.rawTitle && params.rawTitle !== 'tool_call') {
+    lines.push(`title: ${truncateInline(params.rawTitle, 220)}`);
+  }
+
+  const kind = String(params.update?.kind ?? '').trim();
+  if (kind) lines.push(`kind: ${kind}`);
+  lines.push(`status: ${params.status}`);
+
+  if (params.toolCallId) {
+    lines.push(`tool_call_id: ${params.toolCallId}`);
+  }
+
+  const cwd = extractFirstString(params.update, ['cwd', 'input.cwd', 'arguments.cwd']);
+  if (cwd) lines.push(`cwd: ${truncateInline(cwd, 220)}`);
+
+  const command = extractCommandHint(params.update);
+  if (command && params.inferredActions.every((action) => action.verb !== 'run')) {
+    lines.push(`command: ${truncateInline(command, 220)}`);
+  }
+
+  const path = extractPathHint(params.update);
+  if (
+    path &&
+    params.inferredActions.every(
+      (action) => !['read', 'edit', 'move', 'delete'].includes(action.verb),
+    )
+  ) {
+    lines.push(`path: ${truncateInline(path, 220)}`);
+  }
+
+  const exitCode = extractExitCode(params.update);
+  if (exitCode !== null) lines.push(`exit_code: ${exitCode}`);
+
+  const errorText = extractErrorText(params.update);
+  if (errorText) lines.push(`error: ${truncateInline(errorText, 220)}`);
+
+  if (lines.length === 0) return undefined;
+  return lines.join('\n');
+}
+
+function extractCommandHint(update: any): string | null {
+  const command = extractFirstString(update, [
+    'command',
+    'cmd',
+    'input.command',
+    'arguments.command',
+    'result.command',
+  ]);
+  if (!command) return null;
+
+  const args = extractStringArray(update, [
+    'args',
+    'input.args',
+    'arguments.args',
+    'result.args',
+  ]);
+  return args.length > 0 ? `${command} ${args.join(' ')}` : command;
+}
+
+function extractPathHint(update: any): string | null {
+  return extractFirstString(update, [
+    'path',
+    'file',
+    'filepath',
+    'target',
+    'uri',
+    'input.path',
+    'input.file',
+    'input.uri',
+    'arguments.path',
+    'arguments.file',
+    'result.path',
+  ]);
+}
+
+function extractSearchHint(update: any): string | null {
+  return extractFirstString(update, [
+    'query',
+    'pattern',
+    'text',
+    'input.query',
+    'input.pattern',
+    'arguments.query',
+    'arguments.pattern',
+  ]);
+}
+
+function extractExitCode(update: any): number | null {
+  const direct = update?.exitCode;
+  if (typeof direct === 'number') return direct;
+
+  const nested = getPathValue(update, 'result.exitCode');
+  if (typeof nested === 'number') return nested;
+
+  return null;
+}
+
+function extractErrorText(update: any): string | null {
+  const direct = update?.error;
+  if (typeof direct === 'string' && direct.trim()) return direct.trim();
+  if (direct && typeof direct === 'object') {
+    const message = (direct as { message?: unknown }).message;
+    if (typeof message === 'string' && message.trim()) return message.trim();
+  }
+
+  return extractFirstString(update, ['result.error', 'result.message']);
+}
+
+function extractFirstString(root: unknown, paths: string[]): string | null {
+  for (const p of paths) {
+    const value = getPathValue(root, p);
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+function extractStringArray(root: unknown, paths: string[]): string[] {
+  for (const p of paths) {
+    const value = getPathValue(root, p);
+    if (!Array.isArray(value)) continue;
+    const out = value
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (out.length > 0) return out;
+  }
+  return [];
+}
+
+function getPathValue(root: unknown, pathExpr: string): unknown {
+  const segments = pathExpr.split('.');
+  let current: unknown = root;
+  for (const segment of segments) {
+    if (!current || typeof current !== 'object') return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
 }
