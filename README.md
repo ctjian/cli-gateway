@@ -88,7 +88,7 @@ npm run start:guard
 Restart/stop/status/logs:
 
 ```bash
-bash scripts/run-guard.sh restart
+bash scripts/run-guard.sh request-restart
 bash scripts/run-guard.sh stop
 bash scripts/run-guard.sh status
 bash scripts/run-guard.sh logs
@@ -98,10 +98,10 @@ Custom command is supported:
 
 ```bash
 bash scripts/run-guard.sh start -- npm run dev
-bash scripts/run-guard.sh restart -- npm run dev
+bash scripts/run-guard.sh request-restart -- npm run dev
 ```
 
-`start`/`restart` automatically runs:
+`start`/`request-restart` automatically runs:
 
 ```bash
 npm i
@@ -110,6 +110,21 @@ npm run build
 
 Then guard keeps restarting the app on abnormal exit with exponential backoff.
 Before each launch attempt, guard also checks `gateway.lock` under `CLI_GATEWAY_HOME` (or `~/.cli-gateway`), terminates the lock PID if still alive, and removes stale lock files.
+
+Sandbox-friendly restart bridge:
+
+- Run `scripts/restart-watcher.sh` on the host (outside sandbox). It watches `.run-guard/restart.request` and calls `run-guard.sh restart`.
+- From sandbox, only send a restart request marker:
+
+```bash
+bash scripts/run-guard.sh request-restart
+```
+
+- Host watcher startup example:
+
+```bash
+nohup bash scripts/restart-watcher.sh >> .run-guard/restart-watcher.log 2>&1 &
+```
 
 Useful env vars:
 
@@ -120,6 +135,8 @@ Useful env vars:
 - `STOP_TIMEOUT_SECONDS` (default `20`)
 - `SKIP_UPDATE=1` to skip `npm i` + `npm run build`
 - `GUARD_STATE_DIR` to override pid/log directory (default `./.run-guard`)
+- `RESTART_REQUEST_SOURCE` payload source for `request-restart` (default `manual`)
+- `RESTART_REQUEST_COOLDOWN_SECONDS` watcher debounce window (default `10`)
 
 ## Feishu setup (MVP)
 
@@ -135,6 +152,7 @@ Feishu currently runs in webhook event-subscription mode:
 - `/new` start a fresh ACP session for this conversation
 - `/allow <n>` select a pending permission option by index (fallback)
 - `/deny` reject a pending permission request (fallback)
+- `/whitelist list|add|del|clear` manage per-conversation permission whitelist by `tool_kind` (optional prefix scope)
 - `/cron help|list|add|del|enable|disable` manage scheduled prompts
 - `/last` show last run output for this session
 - `/replay [runId]` replay stored `session/update` output for a run (best-effort)
@@ -149,15 +167,19 @@ Telegram note:
 - Chat-scoped command menu is synced best-effort from `cli-inline` commands. Commands with `-` are mapped to `_` in Telegram UI.
 
 Discord note:
-- Built-in commands are available as slash commands (`/help`, `/ui`, `/cli`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/cron`).
+- Built-in commands are available as slash commands (`/help`, `/ui`, `/cli`, `/workspace`, `/new`, `/last`, `/replay`, `/allow`, `/deny`, `/whitelist`, `/cron`).
 - Slash commands are synced at startup (global + per-guild best-effort). Global command propagation may take time on Discord side.
 - ACP `cli-inline` dynamic commands are not yet exposed as Discord slash commands.
 - Inbound message processing uses reaction acks (`🤔` while running, then `🕊` on success or `😢` on error), aligned with Telegram behavior.
+- On fresh ACP sessions, the channel topic/description is injected as a global context block before the user prompt.
 
 ## Security model (default)
 
 - File system and terminal tool calls are restricted to the active workspace root (per conversation; see `/workspace`).
 - Tool execution is **deny-by-default**; the user must approve via ACP permission flow.
+- You can pre-allow specific `tool_kind` values per conversation via `/whitelist add <tool_kind>` (`read|edit|delete|move|search|execute|think|fetch|switch_mode|other`).
+- You can also scope allow rules by prefix: `/whitelist add read /abs/path/prefix` (path kinds) or `/whitelist add execute npm run` (argument prefix). Non-matching calls still require approval.
+- If an agent calls a tool directly without first sending `session/request_permission`, the gateway synthesizes an interactive permission prompt and blocks the tool call until approved/denied.
 - Approvals are interactive on Discord/Telegram (buttons). Discord permission cards also add reaction shortcuts (`👍` allow, `👎` deny; `✅`/`❌` still accepted); `/allow`/`/deny` remain as fallback.
 - You can persist policy choices (e.g. `allow_always` / `reject_always`) per conversation.
 
@@ -189,6 +211,7 @@ To reduce this, `cli-gateway` can replay recent conversation runs from the DB in
 
 - Config keys: `contextReplayEnabled`, `contextReplayRuns`, `contextReplayMaxChars`
 - Default: enabled, last 8 runs, max 12k chars (used only on fresh ACP sessions)
+- Discord-only: fresh sessions also include channel topic/description as global context.
 
 ## Status
 

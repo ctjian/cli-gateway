@@ -7,3 +7,6 @@ coverage/
 *.db-wal
 *.db-shm
 .DS_Store
+.run-guard/*
+.cli-gateway/*
+nohup.out

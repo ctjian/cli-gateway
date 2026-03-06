@@ -38,6 +38,7 @@ This document lists current gaps (vs a "production gateway") and the planned dir
 - Process guard script for auto-restart on abnormal exit (`scripts/run-guard.sh`).
 - Process guard supports daemon lifecycle commands (`start/stop/restart/status/logs`) with `nohup` background mode and auto `npm i && npm run build` on `start/restart`.
 - Process guard now pre-cleans `gateway.lock` (kill lock PID if alive, remove stale lock) before each launch attempt.
+- Added sandbox-safe restart bridge: `run-guard.sh request-restart` marker + host-side `scripts/restart-watcher.sh`.
 - Feishu inbound webhook + outbound send (MVP).
 - First-run interactive config wizard (TTY) + lock directory bootstrap.
 - Default UI mode switched to `summary` (conversation-level `/ui` override still supported).
@@ -45,7 +46,10 @@ This document lists current gaps (vs a "production gateway") and the planned dir
 - Conversation preferences can now be changed before first prompt (`/ui`, `/workspace`, `/cli`) and survive `/new` session reset.
 - ACP transport now fails fast on child exit/bootstrap timeout, returning explicit errors instead of leaving runs hanging.
 - Discord permission approvals now support emoji reactions (`✅`/`👍` allow, `❌`/`👎` deny) in addition to buttons.
+- Gateway now synthesizes interactive permission prompts when an agent calls tools directly without `session/request_permission`, preserving deny-by-default UX.
 - Agent text streaming now auto-splits around tool calls (text-only updates keep editing one message; post-tool assistant output resumes in a new message).
+- Fresh Discord sessions now inject channel topic/description as global context (alongside context replay when enabled).
+- Added `/whitelist` command to manage per-conversation permission allowlist by `tool_kind` with optional path/argument prefix scoping.
 
 ## Suggested Next Steps (Priority)
 

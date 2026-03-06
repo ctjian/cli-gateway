@@ -19,12 +19,14 @@ This file is for coding agents (Codex/Claude/etc) working in this repository.
 - DB schema/migrations: `src/db/migrations.ts`
 - Scheduler: `src/scheduler/scheduler.ts`
 - Channel sinks: `src/channels/discord.ts`, `src/channels/telegram.ts`, `src/channels/feishu.ts`
+- Process guard/restart bridge: `scripts/run-guard.sh`, `scripts/restart-watcher.sh`
 
 ## UI
 
 - UI modes: `verbose` (default) and `summary`.
 - Per-conversation override: `/ui verbose|summary` (stored in DB `ui_prefs`).
 - Per-conversation runtime prefs include `/workspace` and `/cli` (persist across `/new`).
+- Permission allowlist can be managed per conversation via `/whitelist` (`tool_kind` + optional prefix scoped, persisted via `tool_policies` and `tool_allow_prefixes`).
 
 ## Local dev
 
@@ -55,6 +57,7 @@ ACP sessions are process-local; after restart/GC the agent will start with no st
 
 Current mitigation:
 - Context replay on fresh ACP sessions via `CONTEXT_REPLAY_*` (DB-backed replay of recent runs).
+- Discord fresh sessions also prepend channel topic/description as global context when available.
 
 If you change how context is built or injected, update:
 - `src/gateway/history.ts`

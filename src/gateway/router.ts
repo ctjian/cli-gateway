@@ -28,10 +28,11 @@ import {
 } from '../db/jobStore.js';
 import { upsertDeliveryCheckpoint } from '../db/deliveryCheckpointStore.js';
 import { getUiMode, setUiMode } from '../db/uiPrefStore.js';
-import { ToolAuth } from './toolAuth.js';
+import { ToolAuth, parseToolKind, TOOL_KINDS } from './toolAuth.js';
 import { BindingRuntime } from './bindingRuntime.js';
 import type { OutboundSink, UiMode } from './types.js';
 import { buildReplayContextFromRecentRuns } from './history.js';
+import { resolveWorkspacePath } from '../tools/workspace.js';
 
 export type { OutboundSink } from './types.js';
 
@@ -48,6 +49,7 @@ export type UserResource = {
 
 export type UserMessageOptions = {
   resources?: UserResource[];
+  globalContextText?: string;
 };
 
 type CliPresetId = 'codex' | 'claude';
@@ -361,6 +363,7 @@ export class GatewayRouter {
             '/replay [runId]',
             '/allow <n>',
             '/deny',
+            '/whitelist list|add|del|clear',
             '/cron help',
             ...inlineLines,
           ].join('\n'),
@@ -676,6 +679,148 @@ export class GatewayRouter {
         return true;
       }
 
+      case '/whitelist':
+      case '/wl': {
+        const { bindingKey, sessionKey } = this.ensureBindingExists(key);
+        const sub = String(parts[1] ?? 'list').trim().toLowerCase();
+        const sess = getSession(this.db, sessionKey);
+        const workspaceRoot = sess?.cwd ?? this.config.workspaceRoot;
+
+        if (!sub || sub === 'list' || sub === 'show') {
+          const globalRows = this.toolAuth.listPersistentPolicies(
+            bindingKey,
+            'allow',
+          );
+          const prefixRows = this.toolAuth.listAllowPrefixRules(bindingKey);
+
+          if (globalRows.length === 0 && prefixRows.length === 0) {
+            await sink.sendText('Whitelist: (empty)');
+            return true;
+          }
+
+          const lines = ['Whitelist:'];
+          for (const row of globalRows) {
+            lines.push(`- ${row.toolKind} (all)`);
+          }
+          for (const row of prefixRows) {
+            lines.push(`- ${row.toolKind} prefix: ${row.argPrefix}`);
+          }
+
+          await sink.sendText(lines.join('\n'));
+          return true;
+        }
+
+        if (sub === 'add') {
+          const toolKind = parseToolKind(parts[2]);
+          const rawPrefix = parts.slice(3).join(' ').trim();
+          if (!toolKind) {
+            await sink.sendText(whitelistUsageText());
+            return true;
+          }
+
+          if (!rawPrefix) {
+            this.toolAuth.setPersistentPolicy(bindingKey, toolKind, 'allow');
+            await sink.sendText(`OK: whitelisted ${toolKind} (all)`);
+            return true;
+          }
+
+          const normalizedPrefix = normalizeWhitelistPrefix(
+            toolKind,
+            rawPrefix,
+            workspaceRoot,
+          );
+          if (!normalizedPrefix) {
+            await sink.sendText(whitelistUsageText());
+            return true;
+          }
+
+          // Scoped prefix rules should not accidentally inherit broader allow-all.
+          this.toolAuth.clearPersistentPolicy(bindingKey, toolKind, 'allow');
+          this.toolAuth.setAllowPrefixRule(
+            bindingKey,
+            toolKind,
+            normalizedPrefix,
+          );
+          await sink.sendText(
+            `OK: whitelisted ${toolKind} prefix ${normalizedPrefix}`,
+          );
+          return true;
+        }
+
+        if (
+          sub === 'del' ||
+          sub === 'delete' ||
+          sub === 'remove' ||
+          sub === 'rm'
+        ) {
+          const toolKind = parseToolKind(parts[2]);
+          const rawPrefix = parts.slice(3).join(' ').trim();
+          if (!toolKind) {
+            await sink.sendText(whitelistUsageText());
+            return true;
+          }
+
+          if (rawPrefix) {
+            const normalizedPrefix = normalizeWhitelistPrefix(
+              toolKind,
+              rawPrefix,
+              workspaceRoot,
+            );
+            if (!normalizedPrefix) {
+              await sink.sendText(whitelistUsageText());
+              return true;
+            }
+
+            const removed = this.toolAuth.clearAllowPrefixRule(
+              bindingKey,
+              toolKind,
+              normalizedPrefix,
+            );
+            await sink.sendText(
+              removed
+                ? `OK: removed ${toolKind} prefix ${normalizedPrefix}`
+                : `Whitelist did not include ${toolKind} prefix ${normalizedPrefix}.`,
+            );
+            return true;
+          }
+
+          const removedAll = this.toolAuth.clearPersistentPolicy(
+            bindingKey,
+            toolKind,
+            'allow',
+          );
+          const removedPrefixes = this.toolAuth.clearAllowPrefixRules(
+            bindingKey,
+            toolKind,
+          );
+
+          await sink.sendText(
+            removedAll || removedPrefixes > 0
+              ? `OK: removed ${toolKind} from whitelist`
+              : `Whitelist did not include ${toolKind}.`,
+          );
+          return true;
+        }
+
+        if (sub === 'clear') {
+          const removedAll = this.toolAuth.clearPersistentPolicies(
+            bindingKey,
+            'allow',
+          );
+          const removedPrefixes = this.toolAuth.clearAllowPrefixRules(bindingKey);
+          const removed = removedAll + removedPrefixes;
+          await sink.sendText(
+            removed > 0
+              ? `OK: cleared whitelist (${removed} entries).`
+              : 'Whitelist already empty.',
+          );
+          return true;
+        }
+
+        await sink.sendText(whitelistUsageText());
+        return true;
+      }
+
       case '/cron': {
         const sub = parts[1];
         const bindingKey = bindingKeyFromConversationKey(key);
@@ -825,17 +970,30 @@ export class GatewayRouter {
     });
 
     let contextText = '';
-    if (
-      this.config.contextReplayEnabled &&
-      this.config.contextReplayRuns > 0 &&
-      !rt.hasSessionId()
-    ) {
-      contextText = buildReplayContextFromRecentRuns(this.db, {
-        sessionKey,
-        excludeRunId: runId,
-        maxRuns: this.config.contextReplayRuns,
-        maxChars: this.config.contextReplayMaxChars,
-      });
+    const isFreshSession = !rt.hasSessionId();
+    if (isFreshSession) {
+      const contextParts: string[] = [];
+
+      const globalContextText = formatGlobalContextText(
+        options?.globalContextText,
+      );
+      if (globalContextText) {
+        contextParts.push(globalContextText);
+      }
+
+      if (this.config.contextReplayEnabled && this.config.contextReplayRuns > 0) {
+        const replayContextText = buildReplayContextFromRecentRuns(this.db, {
+          sessionKey,
+          excludeRunId: runId,
+          maxRuns: this.config.contextReplayRuns,
+          maxChars: this.config.contextReplayMaxChars,
+        });
+        if (replayContextText) {
+          contextParts.push(replayContextText);
+        }
+      }
+
+      contextText = contextParts.join('\n\n');
     }
 
     try {
@@ -1006,9 +1164,11 @@ function renderSessionUpdateDelta(update: any): string {
         ? 'started'
         : String(update?.status ?? update?.state ?? 'running').trim() || 'running';
     const title = String(update?.title ?? id ?? 'tool_call').trim() || 'tool_call';
-    return id
-      ? `\n[tool] ${title} · ${status} (${id})`
-      : `\n[tool] ${title} · ${status}`;
+    return formatTextCodeBlock(
+      id
+        ? `[tool] ${title} · ${status} (${id})`
+        : `[tool] ${title} · ${status}`,
+    );
   }
 
   if (update.sessionUpdate === 'plan') {
@@ -1021,6 +1181,55 @@ function renderSessionUpdateDelta(update: any): string {
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return text.slice(0, max - 3) + '...';
+}
+
+function formatTextCodeBlock(text: string): string {
+  const safe = text.trim().replace(/```/g, '``\u200b`');
+  return `\n\`\`\`text\n${safe}\n\`\`\`\n`;
+}
+
+function whitelistUsageText(): string {
+  return [
+    'Usage:',
+    '/whitelist list',
+    '/whitelist add <tool_kind> [prefix]',
+    '/whitelist del <tool_kind> [prefix]',
+    '/whitelist clear',
+    '',
+    'prefix rules:',
+    '- read|edit|delete|move: absolute path prefix under current workspace',
+    '- execute/others: string prefix on command/arguments',
+    '',
+    `tool_kind: ${TOOL_KINDS.join('|')}`,
+  ].join('\n');
+}
+
+const PATH_PREFIX_WHITELIST_KINDS = new Set([
+  'read',
+  'edit',
+  'delete',
+  'move',
+]);
+
+function normalizeWhitelistPrefix(
+  toolKind: string,
+  rawPrefix: string,
+  workspaceRoot: string,
+): string | null {
+  const trimmed = rawPrefix.trim();
+  if (!trimmed) return null;
+
+  if (PATH_PREFIX_WHITELIST_KINDS.has(toolKind)) {
+    if (!path.isAbsolute(trimmed)) return null;
+    try {
+      return resolveWorkspacePath(workspaceRoot, trimmed);
+    } catch {
+      return null;
+    }
+  }
+
+  const normalized = trimmed.replace(/\s+/g, ' ');
+  return normalized || null;
 }
 
 function normalizeCommand(raw: string | undefined): string {
@@ -1053,6 +1262,12 @@ function sanitizeResources(resources: UserMessageOptions['resources']): UserReso
   }
 
   return out;
+}
+
+function formatGlobalContextText(input: string | undefined): string {
+  const text = String(input ?? '').trim();
+  if (!text) return '';
+  return `Global context (channel description):\n${text}`;
 }
 
 function formatPromptTextForStorage(text: string, resources: UserResource[]): string {
