@@ -85,6 +85,20 @@ type PendingRequest = {
 
 const ACP_BOOTSTRAP_TIMEOUT_MS = 30_000;
 
+function stringifyForLog(value: unknown): string {
+  if (value === undefined) return 'undefined';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    try {
+      return String(value);
+    } catch {
+      return '[unserializable]';
+    }
+  }
+}
+
 export class AcpClient {
   private readonly db: Db;
   private readonly workspaceRoot: string;
@@ -484,8 +498,17 @@ export class AcpClient {
                 : '';
             const data =
               res.error?.data !== undefined
-                ? '; data=' + String(res.error.data)
+                ? '; data=' + stringifyForLog(res.error.data)
                 : '';
+
+            log.error('ACP request failed', {
+              method,
+              id,
+              code: res.error?.code,
+              message: res.error?.message,
+              data: res.error?.data,
+            });
+
             reject(new Error(String(res.error.message) + code + data));
             return;
           }
@@ -498,8 +521,14 @@ export class AcpClient {
 
       try {
         const req: JsonRpcRequest = { jsonrpc: '2.0', id, method, params };
+        log.debug('ACP request send', { method, id, params });
         this.rpc.write(req);
       } catch (error: any) {
+        log.error('ACP request write failed', {
+          method,
+          id,
+          error: String(error?.message ?? error),
+        });
         this.rejectPendingRequest(
           id,
           this.makeTransportError(String(error?.message ?? error)),
