@@ -13,7 +13,7 @@ import {
   type ConversationKey,
 } from '../gateway/sessionStore.js';
 import { createTelegramSink } from './telegramSink.js';
-import { setChatMenuButton, setMessageReaction } from './telegramApi.js';
+import { setChatMenuButton, sendChatAction, setMessageReaction } from './telegramApi.js';
 
 export type TelegramController = {
   createSink: (
@@ -24,6 +24,7 @@ export type TelegramController = {
 };
 
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 650;
+const TELEGRAM_TYPING_INTERVAL_MS = 4000;
 
 type PendingTelegramMediaGroup = {
   chatId: number;
@@ -410,6 +411,13 @@ function dispatchTelegramInbound(params: {
     // ignore
   });
 
+  const stopTyping = startTelegramTyping({
+    token: config.telegramToken,
+    chatId,
+    threadId: threadId ? Number(threadId) : null,
+    enabled: !isCommand,
+  });
+
   // IMPORTANT: do not await; grammY processes updates sequentially.
   const p = router.handleUserMessage(
     key,
@@ -420,6 +428,7 @@ function dispatchTelegramInbound(params: {
 
   void p
     .then(async () => {
+      stopTyping();
       await updateTelegramMessageReactions(
         config.telegramToken,
         chatId,
@@ -439,6 +448,7 @@ function dispatchTelegramInbound(params: {
       });
     })
     .catch(async (error) => {
+      stopTyping();
       log.error('Telegram router handler error', error);
       try {
         await updateTelegramMessageReactions(
@@ -476,6 +486,52 @@ async function updateTelegramMessageReactions(
       ),
     ),
   );
+}
+
+async function sendTelegramTyping(params: {
+  token: string;
+  chatId: number;
+  threadId: number | null;
+  enabled: boolean;
+}): Promise<void> {
+  try {
+    await sendChatAction(
+      params.token,
+      {
+        chatId: params.chatId,
+        threadId: params.threadId,
+        action: 'typing',
+      },
+      fetch,
+    );
+  } catch (error) {
+    log.debug('Telegram typing indicator error', error);
+  }
+}
+
+function startTelegramTyping(params: {
+  token: string;
+  chatId: number;
+  threadId: number | null;
+  enabled: boolean;
+}): () => void {
+  if (!params.enabled) return () => {};
+
+  let stopped = false;
+
+  void sendTelegramTyping(params);
+
+  const timer = setInterval(() => {
+    if (stopped) return;
+    void sendTelegramTyping(params);
+  }, TELEGRAM_TYPING_INTERVAL_MS);
+  timer.unref?.();
+
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 async function startLongPolling(bot: Bot): Promise<void> {

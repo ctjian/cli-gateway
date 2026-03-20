@@ -83,6 +83,35 @@ export async function setMessageReaction(
   }
 }
 
+export async function sendChatAction(
+  token: string,
+  params: {
+    chatId: number;
+    threadId: number | null;
+    action: 'typing';
+  },
+  fetchFn: typeof fetch = fetch,
+): Promise<void> {
+  const payload: any = {
+    chat_id: params.chatId,
+    action: params.action,
+  };
+  if (params.threadId) payload.message_thread_id = params.threadId;
+
+  const json = await callTelegram<boolean>(
+    token,
+    'sendChatAction',
+    payload,
+    fetchFn,
+  );
+
+  if (!json.ok) {
+    throw new Error(
+      `sendChatAction failed: ${json.error_code ?? ''} ${json.description ?? ''}`,
+    );
+  }
+}
+
 export async function setChatMenuButton(
   token: string,
   params: {
