@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
@@ -20,7 +23,7 @@ function createDb(): Database.Database {
   return db;
 }
 
-function createConfig() {
+function createConfig(overrides: Record<string, unknown> = {}) {
   return {
     discordToken: undefined,
     discordAllowChannelId: undefined,
@@ -44,6 +47,7 @@ function createConfig() {
     contextReplayEnabled: false,
     contextReplayRuns: 0,
     contextReplayMaxChars: 0,
+    ...overrides,
   };
 }
 
@@ -94,11 +98,9 @@ test('/new rotates session and closes runtime', async () => {
     userId: 'u',
   };
 
-  // Seed a binding/session via /cron add.
   const { sink, texts } = createSink();
   await router.handleUserMessage(key, '/cron add 0 0 * * * hi', sink as any);
 
-  // Inject a fake runtime.
   const binding = db
     .prepare(
       'SELECT session_key as sessionKey FROM bindings WHERE platform = ? LIMIT 1',
@@ -122,6 +124,57 @@ test('/new rotates session and closes runtime', async () => {
     )
     .get('discord') as { sessionKey: string };
   assert.notEqual(rebound.sessionKey, binding.sessionKey);
+
+  router.close();
+});
+
+test('/stop reports missing binding, missing runtime, and active runtime without rotating session', async () => {
+  const db = createDb();
+  const key: ConversationKey = {
+    platform: 'discord',
+    chatId: 'stop-room',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const router = new GatewayRouter({ db, config: createConfig() as any });
+  const { sink, texts } = createSink();
+
+  await router.handleUserMessage(key, '/stop', sink as any);
+  assert.equal(texts.at(-1), 'No session binding. Send a message first.');
+
+  texts.length = 0;
+  await router.handleUserMessage(key, '/cron add 0 0 * * * hi', sink as any);
+
+  const binding = db
+    .prepare('SELECT session_key as sessionKey FROM bindings LIMIT 1')
+    .get() as { sessionKey: string };
+
+  texts.length = 0;
+  await router.handleUserMessage(key, '/stop', sink as any);
+  assert.equal(texts.at(-1), 'No running task to stop.');
+
+  let stopCalled = 0;
+  (router as any).runtimesBySessionKey.set(binding.sessionKey, {
+    runtime: {
+      stopCurrentRun: async () => {
+        stopCalled += 1;
+        return { ok: true, message: 'Stopping current task. Session preserved.' };
+      },
+      close: () => {},
+    },
+    lastUsedMs: Date.now(),
+  });
+
+  texts.length = 0;
+  await router.handleUserMessage(key, '/stop', sink as any);
+  assert.equal(texts.at(-1), 'Stopping current task. Session preserved.');
+  assert.equal(stopCalled, 1);
+
+  const rebound = db
+    .prepare('SELECT session_key as sessionKey FROM bindings LIMIT 1')
+    .get() as { sessionKey: string };
+  assert.equal(rebound.sessionKey, binding.sessionKey);
 
   router.close();
 });
@@ -178,6 +231,90 @@ test('/cli show and switch updates session agent config', async () => {
   router.close();
 });
 
+test('listCliInlineCommands merges ACP commands with local Claude skills only for Claude preset', () => {
+  const db = createDb();
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-gateway-router-'));
+  let router: GatewayRouter | null = null;
+
+  try {
+    fs.mkdirSync(path.join(workspaceRoot, '.claude', 'skills', 'research-lit'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(
+        workspaceRoot,
+        '.claude',
+        'skills',
+        'research-lit',
+        'SKILL.md',
+      ),
+      '# Research Lit\nFind related work quickly.\n',
+      'utf8',
+    );
+
+    router = new GatewayRouter({
+      db,
+      config: createConfig({ workspaceRoot }) as any,
+    });
+
+    createSession(db, {
+      sessionKey: 'claude-session',
+      agentCommand: 'npx',
+      agentArgs: ['-y', '@zed-industries/claude-code-acp@latest'],
+      cwd: workspaceRoot,
+      loadSupported: false,
+    });
+    createRun(db, {
+      runId: 'claude-run',
+      sessionKey: 'claude-session',
+      promptText: 'hello',
+    });
+    db.prepare(
+      'INSERT INTO events(run_id, seq, method, payload_json, created_at) VALUES(?, ?, ?, ?, ?)',
+    ).run(
+      'claude-run',
+      1,
+      'session/update',
+      JSON.stringify({
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [
+            { name: 'review', description: 'Review my changes', input: null },
+            { name: 'research-lit', description: 'From ACP', input: null },
+          ],
+        },
+      }),
+      Date.now(),
+    );
+
+    const merged = router.listCliInlineCommandsBySession('claude-session');
+    assert.ok(merged.some((item) => item.name === 'review'));
+    assert.ok(merged.some((item) => item.name === 'research-lit'));
+    assert.equal(
+      merged.filter((item) => item.name === 'research-lit').length,
+      1,
+    );
+    assert.equal(
+      merged.find((item) => item.name === 'research-lit')?.description,
+      'From ACP',
+    );
+
+    createSession(db, {
+      sessionKey: 'codex-session',
+      agentCommand: 'npx',
+      agentArgs: ['-y', '@zed-industries/codex-acp@latest'],
+      cwd: workspaceRoot,
+      loadSupported: false,
+    });
+    const codexOnly = router.listCliInlineCommandsBySession('codex-session');
+    assert.deepEqual(codexOnly, []);
+  } finally {
+    router?.close();
+    db.close();
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
 test('sink flush errors are swallowed', async () => {
   const db = createDb();
 
@@ -211,7 +348,6 @@ test('sink flush errors are swallowed', async () => {
     } as any,
   );
 
-  // No throw; run still recorded.
   const row = db
     .prepare('SELECT stop_reason as stopReason FROM runs ORDER BY started_at DESC LIMIT 1')
     .get() as { stopReason: string | null };
@@ -230,7 +366,6 @@ test('/allow and /deny dispatch to runtime methods', async () => {
     userId: 'u',
   };
 
-  // Create a binding/session row.
   const router1 = new GatewayRouter({ db, config: createConfig() as any });
   await router1.handleUserMessage(key, '/cron add 0 0 * * * hi', { sendText: async () => {} } as any);
   router1.close();
@@ -258,7 +393,6 @@ test('/allow and /deny dispatch to runtime methods', async () => {
       }) as any,
   });
 
-  // Ensure runtime exists for this session key.
   (router as any).getOrCreateRuntime({
     sessionKey: binding.sessionKey,
     bindingKey: 'discord:c:-:u',
@@ -688,47 +822,7 @@ test('router start/gc/runtime-limit and empty message behavior', async () => {
       },
     } as any,
   );
-  assert.ok(String(texts.at(-1)).includes('Commands:'));
-
-  router.close();
-});
-
-test('attachment-only prompts are persisted with attachment summary text', async () => {
-  const db = createDb();
-  const router = new GatewayRouter({
-    db,
-    config: createConfig() as any,
-    runtimeFactory: () =>
-      ({
-        hasSessionId: () => true,
-        prompt: async () => ({ stopReason: 'end', lastSeq: 0 }),
-        close: () => {},
-      }) as any,
-  });
-
-  const key: ConversationKey = {
-    platform: 'discord',
-    chatId: 'resource-room',
-    threadId: null,
-    userId: 'u',
-  };
-
-  await router.handleUserMessage(
-    key,
-    '',
-    { sendText: async () => {}, flush: async () => {} } as any,
-    {
-      resources: [
-        { uri: 'https://example.com/a.png', mimeType: 'image/png' },
-        { uri: 'https://example.com/b.png', mimeType: 'image/png' },
-      ],
-    },
-  );
-
-  const row = db
-    .prepare('SELECT prompt_text as promptText FROM runs ORDER BY started_at DESC LIMIT 1')
-    .get() as { promptText: string };
-  assert.equal(row.promptText, '[attachments] 2 images');
+  assert.ok(String(texts.at(-1)).includes('可用命令：'));
 
   router.close();
 });

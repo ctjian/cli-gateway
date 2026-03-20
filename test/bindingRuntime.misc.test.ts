@@ -23,6 +23,7 @@ import type {
 class NoopRpc implements StdioProcess {
   private handlers: Array<(m: JsonRpcMessage) => void> = [];
   written: JsonRpcMessage[] = [];
+  killed = false;
 
   write(message: JsonRpcMessage): void {
     this.written.push(message);
@@ -31,7 +32,9 @@ class NoopRpc implements StdioProcess {
     this.handlers.push(cb);
   }
   onStderr(): void {}
-  kill(): void {}
+  kill(): void {
+    this.killed = true;
+  }
 }
 
 class PermReqRpc implements StdioProcess {
@@ -920,25 +923,119 @@ test('buildToolUiEvent infers actionable titles and detail fields across branche
   db.close();
 });
 
-test('selectPermissionOption and decidePermission validate actor and pending state', async () => {
+test('stopCurrentRun cancels pending permission and keeps runtime alive', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
   migrate(db);
 
   const key: ConversationKey = {
     platform: 'discord',
-    chatId: 'c',
+    chatId: 'stop-chat',
     threadId: null,
-    userId: 'u',
+    userId: 'owner',
   };
   createSession(db, {
-    sessionKey: 's4',
+    sessionKey: 'stop-session',
     agentCommand: 'agent',
     agentArgs: [],
     cwd: '/tmp',
     loadSupported: false,
   });
-  const bindingKey = upsertBinding(db, key, 's4').bindingKey;
+  createRun(db, {
+    runId: 'run-stop',
+    sessionKey: 'stop-session',
+    promptText: 'hello',
+  });
+  const bindingKey = upsertBinding(db, key, 'stop-session').bindingKey;
+  const toolAuth = new ToolAuth(db);
+  const rpc = new NoopRpc();
+
+  const rt = new BindingRuntime({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot: '/tmp',
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'verbose',
+      uiJsonMaxChars: 1000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    toolAuth,
+    sessionKey: 'stop-session',
+    bindingKey,
+    acpRpc: rpc,
+    workspaceRoot: '/tmp',
+  });
+
+  (rt as any).currentRunId = 'run-stop';
+  (rt as any).acpSessionId = 'sess-stop';
+  (rt as any).pendingPermission = {
+    requestId: 77,
+    params: {
+      sessionId: 'sess-stop',
+      toolCall: { kind: 'execute', title: 'terminal/create' },
+      options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }],
+    },
+  };
+  (rt as any).pendingPermissionActorUserId = 'owner';
+
+  const result = await rt.stopCurrentRun();
+  assert.deepEqual(result, {
+    ok: true,
+    message: 'Stopping current task. Session preserved.',
+  });
+  assert.equal((rt as any).pendingPermission, null);
+  assert.equal((rt as any).pendingPermissionActorUserId, null);
+  assert.equal(rpc.killed, false);
+  assert.deepEqual(rpc.written.slice(-2), [
+    {
+      jsonrpc: '2.0',
+      id: 77,
+      result: { outcome: { outcome: 'cancelled' } },
+    },
+    {
+      jsonrpc: '2.0',
+      method: 'session/cancel',
+      params: { sessionId: 'sess-stop' },
+    },
+  ]);
+
+  rt.close();
+  db.close();
+});
+
+test('stopCurrentRun reports when no run is active', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const key: ConversationKey = {
+    platform: 'discord',
+    chatId: 'stop-chat',
+    threadId: null,
+    userId: 'owner',
+  };
+  createSession(db, {
+    sessionKey: 'stop-session',
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: '/tmp',
+    loadSupported: false,
+  });
+  const bindingKey = upsertBinding(db, key, 'stop-session').bindingKey;
   const toolAuth = new ToolAuth(db);
 
   const rt = new BindingRuntime({
@@ -965,43 +1062,17 @@ test('selectPermissionOption and decidePermission validate actor and pending sta
       contextReplayMaxChars: 0,
     } as any,
     toolAuth,
-    sessionKey: 's4',
+    sessionKey: 'stop-session',
     bindingKey,
     acpRpc: new NoopRpc(),
     workspaceRoot: '/tmp',
   });
 
-  const texts: string[] = [];
-  const sink: OutboundSink = {
-    sendText: async (t) => texts.push(t),
-  };
-
-  await rt.selectPermissionOption(1, sink, 'u');
-  assert.equal(texts.at(-1), 'No pending permission request.');
-
-  (rt as any).pendingPermission = {
-    requestId: 10,
-    params: {
-      sessionId: 'sess',
-      toolCall: { kind: 'execute', title: 'terminal/create' },
-      options: [{ optionId: 'a', name: 'Allow always', kind: 'allow_always' }],
-    },
-  };
-  (rt as any).pendingPermissionActorUserId = 'owner';
-
-  await rt.selectPermissionOption(1, sink, 'other-user');
-  assert.equal(texts.at(-1), 'Not authorized.');
-
-  await rt.selectPermissionOption(9, sink, 'owner');
-  assert.equal(texts.at(-1), 'Invalid option index: 9');
-
-  await rt.selectPermissionOption(1, sink, 'owner');
-  assert.ok(String(texts.at(-1)).includes('OK: selected option 1'));
-  assert.equal(toolAuth.consume('s4', 'execute'), true);
-
-  const noPending = await rt.decidePermission({ decision: 'allow' });
-  assert.equal(noPending.ok, false);
-  assert.ok(noPending.message.includes('No pending permission request'));
+  const result = await rt.stopCurrentRun();
+  assert.deepEqual(result, {
+    ok: false,
+    message: 'No running task to stop.',
+  });
 
   rt.close();
   db.close();

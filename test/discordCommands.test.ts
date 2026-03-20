@@ -36,6 +36,7 @@ test('buildDiscordSlashCommands includes base command names', () => {
     'last',
     'new',
     'replay',
+    'stop',
     'ui',
     'whitelist',
     'workspace',
@@ -50,6 +51,10 @@ test('mapDiscordSlashToRouterCommand maps simple commands', () => {
   assert.equal(
     mapDiscordSlashToRouterCommand(makeInteraction({ commandName: 'new' })),
     '/new',
+  );
+  assert.equal(
+    mapDiscordSlashToRouterCommand(makeInteraction({ commandName: 'stop' })),
+    '/stop',
   );
   assert.equal(
     mapDiscordSlashToRouterCommand(makeInteraction({ commandName: 'last' })),

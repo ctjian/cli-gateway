@@ -2,6 +2,10 @@ import {
   SlashCommandBuilder,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from 'discord.js';
+import {
+  getBuiltinCommand,
+  listBuiltinCommands,
+} from '../gateway/commandCatalog.js';
 import { TOOL_KINDS } from '../gateway/toolAuth.js';
 
 export type DiscordSlashInteractionLike = {
@@ -14,191 +18,182 @@ export type DiscordSlashInteractionLike = {
 };
 
 export function buildDiscordSlashCommands(): RESTPostAPIChatInputApplicationCommandsJSONBody[] {
-  return [
-    new SlashCommandBuilder()
-      .setName('help')
-      .setDescription('Show available commands'),
-
-    new SlashCommandBuilder()
-      .setName('new')
-      .setDescription('Reset conversation session'),
-
-    new SlashCommandBuilder()
-      .setName('last')
-      .setDescription('Show last run output'),
-
-    new SlashCommandBuilder()
-      .setName('deny')
-      .setDescription('Reject a pending permission request'),
-
-    new SlashCommandBuilder()
-      .setName('ui')
-      .setDescription('Show or set UI mode')
-      .addStringOption((opt) =>
-        opt
-          .setName('mode')
-          .setDescription('verbose, summary, or show')
-          .setRequired(false)
-          .addChoices(
-            { name: 'show', value: 'show' },
-            { name: 'verbose', value: 'verbose' },
-            { name: 'summary', value: 'summary' },
-          ),
-      ),
-
-    new SlashCommandBuilder()
-      .setName('cli')
-      .setDescription('Show or switch ACP CLI preset')
-      .addStringOption((opt) =>
-        opt
-          .setName('preset')
-          .setDescription('show, codex, or claude')
-          .setRequired(false)
-          .addChoices(
-            { name: 'show', value: 'show' },
-            { name: 'codex', value: 'codex' },
-            { name: 'claude', value: 'claude' },
-          ),
-      ),
-
-    new SlashCommandBuilder()
-      .setName('workspace')
-      .setDescription('Show or set workspace root')
-      .addStringOption((opt) =>
-        opt
-          .setName('path')
-          .setDescription('absolute path, or ~ / ~/...')
-          .setRequired(false),
-      ),
-
-    new SlashCommandBuilder()
-      .setName('replay')
-      .setDescription('Replay stored session/update output for a run')
-      .addStringOption((opt) =>
-        opt.setName('run_id').setDescription('Run ID').setRequired(false),
-      ),
-
-    new SlashCommandBuilder()
-      .setName('allow')
-      .setDescription('Approve a pending permission option by index')
-      .addIntegerOption((opt) =>
-        opt
-          .setName('index')
-          .setDescription('1-based permission option index')
-          .setRequired(true)
-          .setMinValue(1),
-      ),
-
-    new SlashCommandBuilder()
-      .setName('whitelist')
-      .setDescription('Manage permission whitelist for this conversation')
-      .addSubcommand((sub) =>
-        sub.setName('list').setDescription('List whitelisted tool kinds'),
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('add')
-          .setDescription('Add a whitelisted tool kind')
-          .addStringOption((opt) =>
-            TOOL_KINDS.reduce(
-              (builder, kind) => builder.addChoices({ name: kind, value: kind }),
-              opt
-                .setName('tool_kind')
-                .setDescription('Tool kind to whitelist')
-                .setRequired(true),
-            ),
-          )
+  const builders = listBuiltinCommands().map((command) => {
+    switch (command.name) {
+      case 'ui':
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description)
           .addStringOption((opt) =>
             opt
-              .setName('prefix')
-              .setDescription('Optional path/argument prefix')
+              .setName('mode')
+              .setDescription('verbose, summary, or show')
+              .setRequired(false)
+              .addChoices(
+                { name: 'show', value: 'show' },
+                { name: 'verbose', value: 'verbose' },
+                { name: 'summary', value: 'summary' },
+              ),
+          );
+      case 'cli':
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description)
+          .addStringOption((opt) =>
+            opt
+              .setName('preset')
+              .setDescription('show, codex, or claude')
+              .setRequired(false)
+              .addChoices(
+                { name: 'show', value: 'show' },
+                { name: 'codex', value: 'codex' },
+                { name: 'claude', value: 'claude' },
+              ),
+          );
+      case 'workspace':
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description)
+          .addStringOption((opt) =>
+            opt
+              .setName('path')
+              .setDescription('absolute path, or ~ / ~/...')
               .setRequired(false),
-          ),
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('del')
-          .setDescription('Remove a tool kind from whitelist')
+          );
+      case 'replay':
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description)
           .addStringOption((opt) =>
-            TOOL_KINDS.reduce(
-              (builder, kind) => builder.addChoices({ name: kind, value: kind }),
-              opt
-                .setName('tool_kind')
-                .setDescription('Tool kind to remove')
-                .setRequired(true),
-            ),
-          )
-          .addStringOption((opt) =>
+            opt.setName('run_id').setDescription('Run ID').setRequired(false),
+          );
+      case 'allow':
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description)
+          .addIntegerOption((opt) =>
             opt
-              .setName('prefix')
-              .setDescription('Optional path/argument prefix')
-              .setRequired(false),
-          ),
-      )
-      .addSubcommand((sub) =>
-        sub.setName('clear').setDescription('Clear whitelist entries'),
-      ),
+              .setName('index')
+              .setDescription('1-based permission option index')
+              .setRequired(true)
+              .setMinValue(1),
+          );
+      case 'whitelist':
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description)
+          .addSubcommand((sub) =>
+            sub.setName('list').setDescription('List whitelisted tool kinds'),
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName('add')
+              .setDescription('Add a whitelisted tool kind')
+              .addStringOption((opt) =>
+                TOOL_KINDS.reduce(
+                  (builder, kind) => builder.addChoices({ name: kind, value: kind }),
+                  opt
+                    .setName('tool_kind')
+                    .setDescription('Tool kind to whitelist')
+                    .setRequired(true),
+                ),
+              )
+              .addStringOption((opt) =>
+                opt
+                  .setName('prefix')
+                  .setDescription('Optional path/argument prefix')
+                  .setRequired(false),
+              ),
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName('del')
+              .setDescription('Remove a tool kind from whitelist')
+              .addStringOption((opt) =>
+                TOOL_KINDS.reduce(
+                  (builder, kind) => builder.addChoices({ name: kind, value: kind }),
+                  opt
+                    .setName('tool_kind')
+                    .setDescription('Tool kind to remove')
+                    .setRequired(true),
+                ),
+              )
+              .addStringOption((opt) =>
+                opt
+                  .setName('prefix')
+                  .setDescription('Optional path/argument prefix')
+                  .setRequired(false),
+              ),
+          )
+          .addSubcommand((sub) =>
+            sub.setName('clear').setDescription('Clear whitelist entries'),
+          );
+      case 'cron':
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description)
+          .addSubcommand((sub) =>
+            sub.setName('help').setDescription('Show cron usage'),
+          )
+          .addSubcommand((sub) => sub.setName('list').setDescription('List jobs'))
+          .addSubcommand((sub) =>
+            sub
+              .setName('add')
+              .setDescription('Add a scheduler job')
+              .addStringOption((opt) =>
+                opt
+                  .setName('expr')
+                  .setDescription('Cron expr: m h dom mon dow')
+                  .setRequired(true),
+              )
+              .addStringOption((opt) =>
+                opt
+                  .setName('prompt')
+                  .setDescription('Prompt template')
+                  .setRequired(true),
+              ),
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName('del')
+              .setDescription('Delete a job')
+              .addStringOption((opt) =>
+                opt
+                  .setName('job_id')
+                  .setDescription('Job ID')
+                  .setRequired(true),
+              ),
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName('enable')
+              .setDescription('Enable a job')
+              .addStringOption((opt) =>
+                opt
+                  .setName('job_id')
+                  .setDescription('Job ID')
+                  .setRequired(true),
+              ),
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName('disable')
+              .setDescription('Disable a job')
+              .addStringOption((opt) =>
+                opt
+                  .setName('job_id')
+                  .setDescription('Job ID')
+                  .setRequired(true),
+              ),
+          );
+      default:
+        return new SlashCommandBuilder()
+          .setName(command.name)
+          .setDescription(command.description);
+    }
+  });
 
-    new SlashCommandBuilder()
-      .setName('cron')
-      .setDescription('Manage scheduler jobs')
-      .addSubcommand((sub) =>
-        sub.setName('help').setDescription('Show cron usage'),
-      )
-      .addSubcommand((sub) =>
-        sub.setName('list').setDescription('List jobs'),
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('add')
-          .setDescription('Add a scheduler job')
-          .addStringOption((opt) =>
-            opt
-              .setName('expr')
-              .setDescription('Cron expr: m h dom mon dow')
-              .setRequired(true),
-          )
-          .addStringOption((opt) =>
-            opt
-              .setName('prompt')
-              .setDescription('Prompt template')
-              .setRequired(true),
-          ),
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('del')
-          .setDescription('Delete a job')
-          .addStringOption((opt) =>
-            opt
-              .setName('job_id')
-              .setDescription('Job ID')
-              .setRequired(true),
-          ),
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('enable')
-          .setDescription('Enable a job')
-          .addStringOption((opt) =>
-            opt
-              .setName('job_id')
-              .setDescription('Job ID')
-              .setRequired(true),
-          ),
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName('disable')
-          .setDescription('Disable a job')
-          .addStringOption((opt) =>
-            opt
-              .setName('job_id')
-              .setDescription('Job ID')
-              .setRequired(true),
-          ),
-      ),
-  ].map((b) => b.toJSON());
+  return builders.map((b) => b.toJSON());
 }
 
 export function mapDiscordSlashToRouterCommand(
@@ -208,13 +203,11 @@ export function mapDiscordSlashToRouterCommand(
 
   switch (cmd) {
     case 'help':
-      return '/help';
     case 'new':
-      return '/new';
+    case 'stop':
     case 'last':
-      return '/last';
     case 'deny':
-      return '/deny';
+      return `/${cmd}`;
     case 'ui': {
       const mode = interaction.options.getString('mode');
       return mode ? `/ui ${mode}` : '/ui';
@@ -263,6 +256,6 @@ export function mapDiscordSlashToRouterCommand(
       return `/cron ${sub}`;
     }
     default:
-      return null;
+      return getBuiltinCommand(cmd) ? `/${cmd}` : null;
   }
 }

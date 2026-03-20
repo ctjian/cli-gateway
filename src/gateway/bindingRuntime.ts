@@ -454,6 +454,23 @@ export class BindingRuntime {
     return { ok: true, message: 'OK: cancelled permission request.' };
   }
 
+  async stopCurrentRun(): Promise<{ ok: boolean; message: string }> {
+    if (!this.currentRunId || !this.acpSessionId) {
+      return { ok: false, message: 'No running task to stop.' };
+    }
+
+    const pendingPermission = this.pendingPermission;
+    this.pendingPermission = null;
+    this.pendingPermissionActorUserId = null;
+
+    if (pendingPermission) {
+      await this.client.respondPermission(pendingPermission, { kind: 'cancelled' });
+    }
+
+    this.client.notifyCancel(this.acpSessionId);
+    return { ok: true, message: 'Stopping current task. Session preserved.' };
+  }
+
   async denyPermission(sink: OutboundSink, actorUserId?: string): Promise<void> {
     const res = await this.decidePermission({ decision: 'deny', actorUserId });
     await sink.sendText(res.message);

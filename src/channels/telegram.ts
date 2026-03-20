@@ -12,6 +12,11 @@ import {
   SHARED_CHAT_SCOPE_USER_ID,
   type ConversationKey,
 } from '../gateway/sessionStore.js';
+import {
+  listTelegramBuiltinCommands,
+  localizeInlineCommandDescription,
+  toTelegramCommandName,
+} from '../gateway/commandCatalog.js';
 import { createTelegramSink } from './telegramSink.js';
 import { setChatMenuButton, sendChatAction, setMessageReaction } from './telegramApi.js';
 
@@ -25,6 +30,7 @@ export type TelegramController = {
 
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 650;
 const TELEGRAM_TYPING_INTERVAL_MS = 4000;
+const TELEGRAM_TEXT_LIMIT = 4096;
 
 type PendingTelegramMediaGroup = {
   chatId: number;
@@ -52,16 +58,7 @@ export async function startTelegram(
   const chatCommandSignatures = new Map<number, string>();
   const pendingMediaGroups = new Map<string, PendingTelegramMediaGroup>();
 
-  const tgCommands = [
-    { command: 'help', description: 'Show commands' },
-    { command: 'ui', description: 'Set UI mode (verbose/summary)' },
-    { command: 'cli', description: 'Show/switch ACP CLI preset' },
-    { command: 'workspace', description: 'Show/set workspace' },
-    { command: 'cron', description: 'Manage scheduler jobs' },
-    { command: 'new', description: 'Reset conversation session' },
-    { command: 'last', description: 'Show last run output' },
-    { command: 'replay', description: 'Replay a run output' },
-  ];
+  const tgCommands = listTelegramBuiltinCommands();
 
   // Best-effort: register commands.
   void bot.api
@@ -564,7 +561,7 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function remapTelegramInlineCommand(
+export function remapTelegramInlineCommand(
   text: string,
   inlineCommands: CliInlineCommand[],
 ): string {
@@ -712,7 +709,7 @@ async function extractTelegramImageResources(
   return out;
 }
 
-async function syncTelegramCommandsForChat(params: {
+export async function syncTelegramCommandsForChat(params: {
   bot: Bot;
   chatId: number;
   baseCommands: Array<{ command: string; description: string }>;
@@ -728,9 +725,7 @@ async function syncTelegramCommandsForChat(params: {
 
     merged.push({
       command,
-      description: truncateTelegramDescription(
-        `cli-inline: ${item.description || item.name}`,
-      ),
+      description: formatTelegramInlineDescription(item),
     });
     seen.add(command);
 
@@ -747,23 +742,38 @@ async function syncTelegramCommandsForChat(params: {
   params.signatures.set(params.chatId, signature);
 }
 
-function toTelegramCommandName(name: string): string | null {
-  const normalized = name
-    .trim()
-    .toLowerCase()
-    .replaceAll('-', '_')
-    .replace(/[^a-z0-9_]/g, '');
-
-  if (!normalized) return null;
-  if (normalized.length > 32) return null;
-  if (!/^[a-z]/.test(normalized)) return null;
-  return normalized;
+function formatTelegramInlineDescription(item: CliInlineCommand): string {
+  const command = toTelegramCommandName(item.name) ?? item.name;
+  const canonical = command !== item.name ? ` -> /${item.name}` : '';
+  const desc = localizeInlineCommandDescription(item.name, item.description);
+  return truncateTelegramDescription(`cli-inline /${command}${canonical}: ${desc}`);
 }
 
 function truncateTelegramDescription(text: string): string {
-  const trimmed = text.trim() || 'cli-inline command';
+  const trimmed = text.trim() || 'cli-inline 命令';
   if (trimmed.length <= 256) return trimmed;
   return trimmed.slice(0, 253) + '...';
+}
+
+export function splitTelegramMessageChunks(
+  text: string,
+  maxLen = TELEGRAM_TEXT_LIMIT,
+): string[] {
+  const chunks: string[] = [];
+  let rest = String(text ?? '').trim();
+
+  while (rest.length > maxLen) {
+    let cut = rest.lastIndexOf('\n', maxLen);
+    if (cut <= 0) cut = maxLen;
+
+    const chunk = rest.slice(0, cut).trim();
+    if (chunk) chunks.push(chunk);
+
+    rest = rest.slice(cut).trim();
+  }
+
+  if (rest) chunks.push(rest);
+  return chunks;
 }
 
 function createTelegramCommandSink(
@@ -781,9 +791,11 @@ function createTelegramCommandSink(
       const out = text.trim();
       text = '';
       if (!out) return;
-      await bot.api.sendMessage(chatId, out, {
-        message_thread_id: threadId ?? undefined,
-      });
+      for (const chunk of splitTelegramMessageChunks(out)) {
+        await bot.api.sendMessage(chatId, chunk, {
+          message_thread_id: threadId ?? undefined,
+        });
+      }
     },
     sendUi: async (event) => {
       const header = `[${event.kind}] ${event.title}`;

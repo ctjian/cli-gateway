@@ -33,6 +33,11 @@ import { BindingRuntime } from './bindingRuntime.js';
 import type { OutboundSink, UiMode } from './types.js';
 import { buildReplayContextFromRecentRuns } from './history.js';
 import { resolveWorkspacePath } from '../tools/workspace.js';
+import {
+  listBuiltinHelpLines,
+  localizeInlineCommandDescription,
+  toTelegramCommandName,
+} from './commandCatalog.js';
 
 export type { OutboundSink } from './types.js';
 
@@ -342,29 +347,15 @@ export class GatewayRouter {
         const inlineLines = inline.length
           ? [
               '',
-              'CLI Inline Commands:',
-              ...inline.map((cmd) => {
-                const desc = truncate(cmd.description, 120);
-                const hint = cmd.inputHint ? ` (input: ${truncate(cmd.inputHint, 40)})` : '';
-                return `/${cmd.name} (cli-inline) - ${desc}${hint}`;
-              }),
+              'CLI Inline Commands:',,
+              ...inline.map((cmd) => formatCliInlineHelpLine(cmd)),
             ]
           : [];
 
         await sink.sendText(
           [
-            'Commands:',
-            '/help',
-            '/ui verbose|summary',
-            '/cli show|codex|claude',
-            '/workspace show|<absolute-path>',
-            '/new',
-            '/last',
-            '/replay [runId]',
-            '/allow <n>',
-            '/deny',
-            '/whitelist list|add|del|clear',
-            '/cron help',
+            '可用命令：',
+            ...listBuiltinHelpLines(),
             ...inlineLines,
           ].join('\n'),
         );
@@ -400,6 +391,24 @@ export class GatewayRouter {
         upsertBinding(this.db, key, nextSessionKey);
 
         await sink.sendText('OK: started a new session for this conversation.');
+        return true;
+      }
+
+      case '/stop': {
+        const binding = getBinding(this.db, key);
+        if (!binding) {
+          await sink.sendText('No session binding. Send a message first.');
+          return true;
+        }
+
+        const entry = this.runtimesBySessionKey.get(binding.sessionKey);
+        if (!entry) {
+          await sink.sendText('No running task to stop.');
+          return true;
+        }
+
+        const result = await entry.runtime.stopCurrentRun();
+        await sink.sendText(result.message);
         return true;
       }
 
@@ -1046,54 +1055,155 @@ export class GatewayRouter {
 
   listCliInlineCommands(key: ConversationKey): CliInlineCommand[] {
     const binding = getBinding(this.db, key);
-    if (!binding) return [];
-    return this.listCliInlineCommandsBySession(binding.sessionKey);
+    if (binding) {
+      return this.listCliInlineCommandsBySession(binding.sessionKey);
+    }
+
+    const defaultPreset = detectCliPreset(
+      this.config.acpAgentCommand,
+      this.config.acpAgentArgs,
+    );
+    if (defaultPreset !== 'claude') return [];
+
+    return listLocalClaudeSkillCommands(this.config.workspaceRoot);
   }
 
   listCliInlineCommandsBySession(sessionKey: string): CliInlineCommand[] {
-    const row = this.db
-      .prepare(
-        `
-        SELECT e.payload_json as payloadJson
-        FROM events e
-        JOIN runs r ON r.run_id = e.run_id
-        WHERE
-          r.session_key = ?
-          AND e.method = 'session/update'
-          AND json_extract(e.payload_json, '$.update.sessionUpdate') = 'available_commands_update'
-        ORDER BY e.created_at DESC, e.seq DESC
-        LIMIT 1
-        `,
-      )
-      .get(sessionKey) as { payloadJson: string } | undefined;
+    const session = getSession(this.db, sessionKey);
+    const agentCommand = session?.agentCommand ?? this.config.acpAgentCommand;
+    const agentArgs = session
+      ? parseSessionAgentArgs(session.agentArgsJson, this.config.acpAgentArgs)
+      : [...this.config.acpAgentArgs];
+    const workspaceRoot = session?.cwd ?? this.config.workspaceRoot;
+    const preset = detectCliPreset(agentCommand, agentArgs);
 
-    if (!row?.payloadJson) return [];
+    return mergeCliInlineCommands(
+      listAcpAvailableCommands(this.db, sessionKey),
+      preset === 'claude' ? listLocalClaudeSkillCommands(workspaceRoot) : [],
+    );
+  }
+}
 
-    try {
-      const payload = JSON.parse(row.payloadJson);
-      const list = payload?.update?.availableCommands;
-      if (!Array.isArray(list)) return [];
+function formatCliInlineHelpLine(cmd: CliInlineCommand): string {
+  const desc = truncate(localizeInlineCommandDescription(cmd.name, cmd.description), 120);
+  const hint = cmd.inputHint ? `（输入：${truncate(cmd.inputHint, 40)}）` : '';
+  const alias = toTelegramCommandName(cmd.name);
+  const aliasNote = alias && alias !== cmd.name ? `/${alias} -> /${cmd.name} ` : `/${cmd.name} `;
+  return `${aliasNote}(cli-inline) - ${desc}${hint}`;
+}
 
-      const out: CliInlineCommand[] = [];
-      const seen = new Set<string>();
+function mergeCliInlineCommands(...lists: CliInlineCommand[][]): CliInlineCommand[] {
+  const out: CliInlineCommand[] = [];
+  const seen = new Set<string>();
 
-      for (const item of list) {
-        const name = String(item?.name ?? '').trim();
-        if (!name || seen.has(name)) continue;
-        seen.add(name);
-
-        out.push({
-          name,
-          description: String(item?.description ?? '').trim(),
-          inputHint: item?.input?.hint ? String(item.input.hint) : null,
-        });
-      }
-
-      return out;
-    } catch {
-      return [];
+  for (const list of lists) {
+    for (const item of list) {
+      const name = String(item?.name ?? '').trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      out.push({
+        name,
+        description: String(item?.description ?? '').trim(),
+        inputHint: item?.inputHint ? String(item.inputHint) : null,
+      });
     }
   }
+
+  return out;
+}
+
+function listAcpAvailableCommands(db: Db, sessionKey: string): CliInlineCommand[] {
+  const row = db
+    .prepare(
+      `
+      SELECT e.payload_json as payloadJson
+      FROM events e
+      JOIN runs r ON r.run_id = e.run_id
+      WHERE
+        r.session_key = ?
+        AND e.method = 'session/update'
+        AND json_extract(e.payload_json, '$.update.sessionUpdate') = 'available_commands_update'
+      ORDER BY e.created_at DESC, e.seq DESC
+      LIMIT 1
+      `,
+    )
+    .get(sessionKey) as { payloadJson: string } | undefined;
+
+  if (!row?.payloadJson) return [];
+
+  try {
+    const payload = JSON.parse(row.payloadJson);
+    const list = payload?.update?.availableCommands;
+    if (!Array.isArray(list)) return [];
+
+    return mergeCliInlineCommands(
+      list.map((item) => ({
+        name: String(item?.name ?? '').trim(),
+        description: String(item?.description ?? '').trim(),
+        inputHint: item?.input?.hint ? String(item.input.hint) : null,
+      })),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function listLocalClaudeSkillCommands(workspaceRoot: string): CliInlineCommand[] {
+  const skillRoots = [path.join(os.homedir(), '.claude', 'skills')];
+  if (workspaceRoot) {
+    skillRoots.push(path.join(workspaceRoot, '.claude', 'skills'));
+  }
+
+  const out: CliInlineCommand[] = [];
+  const seen = new Set<string>();
+
+  for (const skillRoot of skillRoots) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(skillRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name.trim();
+      if (!name || seen.has(name)) continue;
+
+      const skillFile = path.join(skillRoot, name, 'SKILL.md');
+      let content = '';
+      try {
+        content = fs.readFileSync(skillFile, 'utf8');
+      } catch {
+        continue;
+      }
+
+      seen.add(name);
+      out.push({
+        name,
+        description: extractSkillDescription(content, name),
+        inputHint: null,
+      });
+    }
+  }
+
+  return out;
+}
+
+function extractSkillDescription(content: string, fallbackName: string): string {
+  const text = String(content ?? '').replace(/\r\n?/g, '\n');
+  const lines = text.split('\n');
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line === '---') continue;
+    if (line.startsWith('#')) continue;
+    if (/^[a-z0-9_-]+\s*:/i.test(line)) continue;
+    return line;
+  }
+
+  return fallbackName;
 }
 
 function parseSessionAgentArgs(raw: string, fallback: string[]): string[] {

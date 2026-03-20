@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
@@ -21,9 +24,6 @@ function createConfig() {
     feishuAppSecret: undefined,
     feishuVerificationToken: undefined,
     feishuListenPort: 3030,
-    qqAppId: undefined,
-    qqClientSecret: undefined,
-    qqSandbox: false,
     acpAgentCommand: 'node',
     acpAgentArgs: [],
     workspaceRoot: '/tmp/cli-gateway-test',
@@ -39,8 +39,7 @@ function createConfig() {
   };
 }
 
-
-test('/help prints command list without requiring binding', async () => {
+test('/help prints built-in commands without requiring binding', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
   migrate(db);
@@ -60,17 +59,108 @@ test('/help prints command list without requiring binding', async () => {
   } as any);
 
   const text = out.join('\n');
-  assert.ok(text.includes('Commands:'));
+  assert.ok(text.includes('可用命令：'));
   assert.ok(text.includes('/ui'));
   assert.ok(text.includes('/cli'));
   assert.ok(text.includes('/workspace'));
+  assert.ok(text.includes('/stop'));
   assert.ok(text.includes('/whitelist'));
+  assert.ok(text.includes('显示帮助'));
 
   router.close();
   db.close();
 });
 
-test('/help includes cli-inline commands from available_commands_update', async () => {
+test('/help merges ACP commands with local Claude skills and shows Telegram alias', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'cli-gateway-help-'),
+  );
+  let router: GatewayRouter | null = null;
+
+  try {
+    fs.mkdirSync(path.join(workspaceRoot, '.claude', 'skills', 'research-lit'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(
+        workspaceRoot,
+        '.claude',
+        'skills',
+        'research-lit',
+        'SKILL.md',
+      ),
+      '# Research Lit\nFind related work quickly.\n',
+      'utf8',
+    );
+
+    router = new GatewayRouter({
+      db,
+      config: { ...createConfig(), workspaceRoot } as any,
+    });
+
+    const key: ConversationKey = {
+      platform: 'telegram',
+      chatId: 'c',
+      threadId: null,
+      userId: 'u',
+    };
+
+    createSession(db, {
+      sessionKey: 's1',
+      agentCommand: 'npx',
+      agentArgs: ['-y', '@zed-industries/claude-code-acp@latest'],
+      cwd: workspaceRoot,
+      loadSupported: false,
+    });
+    upsertBinding(db, key, 's1');
+
+    createRun(db, {
+      runId: 'r1',
+      sessionKey: 's1',
+      promptText: 'hello',
+    });
+
+    db.prepare(
+      `
+      INSERT INTO events(run_id, seq, method, payload_json, created_at)
+      VALUES(?, ?, 'session/update', ?, ?)
+      `,
+    ).run(
+      'r1',
+      1,
+      JSON.stringify({
+        sessionId: 'acp-s1',
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [
+            { name: 'review', description: 'Review my current changes', input: null },
+          ],
+        },
+      }),
+      Date.now(),
+    );
+
+    const out: string[] = [];
+    await router.handleUserMessage(key, '/help', {
+      sendText: async (t: string) => out.push(t),
+    } as any);
+
+    const text = out.join('\n');
+    assert.ok(text.includes('CLI Inline Commands:'));
+    assert.ok(text.includes('/review (cli-inline) - 审查当前改动'));
+    assert.ok(text.includes('/research_lit -> /research-lit (cli-inline) - 快速查找相关工作'));
+  } finally {
+    router?.close();
+    db.close();
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test('/help keeps original description for unknown inline commands', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
   migrate(db);
@@ -85,17 +175,17 @@ test('/help includes cli-inline commands from available_commands_update', async 
   };
 
   createSession(db, {
-    sessionKey: 's1',
-    agentCommand: 'agent',
-    agentArgs: [],
+    sessionKey: 's2',
+    agentCommand: 'npx',
+    agentArgs: ['-y', '@zed-industries/claude-code-acp@latest'],
     cwd: '/tmp',
     loadSupported: false,
   });
-  upsertBinding(db, key, 's1');
+  upsertBinding(db, key, 's2');
 
   createRun(db, {
-    runId: 'r1',
-    sessionKey: 's1',
+    runId: 'r2',
+    sessionKey: 's2',
     promptText: 'hello',
   });
 
@@ -105,19 +195,14 @@ test('/help includes cli-inline commands from available_commands_update', async 
     VALUES(?, ?, 'session/update', ?, ?)
     `,
   ).run(
-    'r1',
+    'r2',
     1,
     JSON.stringify({
-      sessionId: 'acp-s1',
+      sessionId: 'acp-s2',
       update: {
         sessionUpdate: 'available_commands_update',
         availableCommands: [
-          { name: 'review', description: 'Review my current changes', input: null },
-          {
-            name: 'review-branch',
-            description: 'Review changes against branch',
-            input: { hint: 'branch name' },
-          },
+          { name: 'foo-bar', description: 'Do custom thing', input: null },
         ],
       },
     }),
@@ -130,9 +215,7 @@ test('/help includes cli-inline commands from available_commands_update', async 
   } as any);
 
   const text = out.join('\n');
-  assert.ok(text.includes('CLI Inline Commands:'));
-  assert.ok(text.includes('/review (cli-inline)'));
-  assert.ok(text.includes('/review-branch (cli-inline)'));
+  assert.ok(text.includes('/foo_bar -> /foo-bar (cli-inline) - Do custom thing'));
 
   router.close();
   db.close();
