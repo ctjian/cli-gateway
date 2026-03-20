@@ -1,6 +1,6 @@
 import type { Db } from '../db/db.js';
 
-export type Platform = 'discord' | 'telegram' | 'feishu';
+export type Platform = 'discord' | 'telegram' | 'feishu' | 'qq';
 
 // Shared scope marker for group/channel conversations.
 export const SHARED_CHAT_SCOPE_USER_ID = '__chat_scope__';

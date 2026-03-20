@@ -57,6 +57,10 @@ function createConfigSchema(defaults: {
     feishuVerificationToken: z.string().optional(),
     feishuListenPort: z.number().int().min(1).max(65535).default(3030),
 
+    qqAppId: z.string().optional(),
+    qqClientSecret: z.string().optional(),
+    qqSandbox: z.boolean().default(false),
+
     acpAgentCommand: z.string().min(1).default('npx'),
     acpAgentArgs: z
       .array(z.string())
@@ -220,6 +224,15 @@ async function runFirstTimeSetup(params: {
       feishuListenPort = await askPortWithDefault(rl, 'Feishu listen port', 3030);
     }
 
+    const qqAppId = await askOptional(rl, 'QQ app id (optional)');
+    const qqClientSecret = qqAppId
+      ? await askOptional(rl, 'QQ client secret (optional)')
+      : '';
+    const qqSandbox =
+      qqAppId && qqClientSecret
+        ? await askYesNo(rl, 'Enable QQ sandbox', false)
+        : false;
+
     const raw: Record<string, unknown> = {
       workspaceRoot,
       dbPath,
@@ -239,6 +252,11 @@ async function runFirstTimeSetup(params: {
     }
     if (feishuAppId && feishuAppSecret) {
       raw.feishuListenPort = feishuListenPort;
+    }
+    if (qqAppId) raw.qqAppId = qqAppId;
+    if (qqClientSecret) raw.qqClientSecret = qqClientSecret;
+    if (qqAppId && qqClientSecret) {
+      raw.qqSandbox = qqSandbox;
     }
 
     params.output.write('\nSaved config. You can edit it later at:\n');

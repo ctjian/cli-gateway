@@ -21,6 +21,9 @@ function createConfig() {
     feishuAppSecret: undefined,
     feishuVerificationToken: undefined,
     feishuListenPort: 3030,
+    qqAppId: undefined,
+    qqClientSecret: undefined,
+    qqSandbox: false,
     acpAgentCommand: 'node',
     acpAgentArgs: [],
     workspaceRoot: '/tmp/cli-gateway-test',
@@ -35,6 +38,7 @@ function createConfig() {
     contextReplayMaxChars: 0,
   };
 }
+
 
 test('/help prints command list without requiring binding', async () => {
   const db = new Database(':memory:');

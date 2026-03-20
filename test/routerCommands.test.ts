@@ -31,6 +31,10 @@ function createConfig() {
     feishuVerificationToken: undefined,
     feishuListenPort: 3030,
 
+    qqAppId: undefined,
+    qqClientSecret: undefined,
+    qqSandbox: false,
+
     acpAgentCommand: 'node',
     acpAgentArgs: [],
 

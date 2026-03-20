@@ -11,6 +11,7 @@ import { GatewayRouter } from './gateway/router.js';
 import { startDiscord, type DiscordController } from './channels/discord.js';
 import { startTelegram, type TelegramController } from './channels/telegram.js';
 import { startFeishu, type FeishuController } from './channels/feishu.js';
+import { startQQ, type QQController } from './channels/qq.js';
 import { startScheduler } from './scheduler/scheduler.js';
 
 async function main(): Promise<void> {
@@ -41,6 +42,7 @@ async function main(): Promise<void> {
   let discord: DiscordController | null = null;
   let telegram: TelegramController | null = null;
   let feishu: FeishuController | null = null;
+  let qq: QQController | null = null;
 
   const router = new GatewayRouter({
     db,
@@ -55,6 +57,7 @@ async function main(): Promise<void> {
   discord = await startDiscord(router, config);
   telegram = await startTelegram(router, config);
   feishu = await startFeishu(router, config);
+  qq = await startQQ(router, config);
 
   if (config.schedulerEnabled) {
     scheduler = startScheduler({
@@ -77,6 +80,11 @@ async function main(): Promise<void> {
           return feishu.createSink(chatId, userId);
         }
 
+        if (platform === 'qq') {
+          if (!qq) throw new Error('QQ disabled');
+          return qq.createSink(chatId, threadId, userId);
+        }
+
         throw new Error(`Unsupported platform: ${platform}`);
       },
     });
@@ -91,6 +99,9 @@ async function main(): Promise<void> {
   const shutdown = () => {
     log.warn('Shutting down...');
     scheduler?.stop();
+    void qq?.close().catch((error) => {
+      log.warn('QQ shutdown error', error);
+    });
     router.close();
     db.close();
     process.exit(0);

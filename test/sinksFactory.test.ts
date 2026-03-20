@@ -11,9 +11,25 @@ test('createSinkFactory returns telegram sink', () => {
         sendText: async () => {},
       }),
     } as any,
+    qq: null,
   });
 
   const sink = sinkFactory('telegram', 'c', null, 'u');
+  assert.equal(typeof sink.sendText, 'function');
+});
+
+test('createSinkFactory returns qq sink', () => {
+  const sinkFactory = createSinkFactory({
+    discord: null,
+    telegram: null,
+    qq: {
+      createSink: (_chatId: string, _threadId: string | null, _userId: string) => ({
+        sendText: async () => {},
+      }),
+    } as any,
+  });
+
+  const sink = sinkFactory('qq', 'c', 'qq:c2c', 'u');
   assert.equal(typeof sink.sendText, 'function');
 });
 
@@ -21,6 +37,7 @@ test('createSinkFactory throws for unsupported/async discord sink', () => {
   const sinkFactory = createSinkFactory({
     discord: {} as any,
     telegram: null,
+    qq: null,
   });
 
   assert.throws(() => sinkFactory('discord', 'c', null, 'u'));

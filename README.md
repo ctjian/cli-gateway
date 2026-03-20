@@ -9,6 +9,7 @@ Chat-channel ↔ ACP agent gateway with scheduler.
 - Discord
 - Telegram
 - Feishu (webhook mode, MVP)
+- QQ (C2C + channel @, MVP)
 
 It uses **one ACP stdio agent process per conversation binding** to avoid cross-talk and support concurrency.
 
@@ -146,6 +147,24 @@ Feishu currently runs in webhook event-subscription mode:
 - Config file keys: `feishuAppId`, `feishuAppSecret`, `feishuVerificationToken`, `feishuListenPort`
 - Assumption: event payloads are **not** encrypted (no encrypt key)
 
+## QQ setup (v1)
+
+QQ support uses the official QQ Open Platform APIs.
+
+- Config file keys: `qqAppId`, `qqClientSecret`, `qqSandbox`
+- `qqSandbox` switches the QQ client between sandbox and production endpoints
+- Supported in v1:
+  - C2C private chat
+  - channel messages that `@` the bot
+  - scheduler replies back to the same QQ conversation type
+  - image input passed through to the agent as resource URLs
+- Not supported in v1:
+  - group `@` messages
+  - voice or file handling
+  - rich approval cards / QQ-native permission UI
+  - message-edit style streaming output
+- Image inputs are forwarded as URLs only; `cli-gateway` does not download QQ attachments to local disk.
+
 ## Chat commands (MVP)
 
 - `/help` show available commands
@@ -200,6 +219,10 @@ Agent text is streamed by editing one message while output is text-only; when a 
 - Telegram:
   - Private chat: isolated per user
   - Group/supergroup/topic: isolated per chat (and topic thread when present)
+- QQ:
+  - C2C: isolated per user
+  - Channel `@` messages: isolated per channel (shared across members in that channel)
+  - Scheduler replies preserve QQ route kind via `threadId` values `qq:c2c` and `qq:channel`
 - Workspace root (`/workspace`) and run history follow the same binding scope.
 - `/new` starts a fresh ACP session but keeps conversation-scoped preferences (UI mode, workspace root, CLI preset, permission policies).
 

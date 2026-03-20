@@ -11,6 +11,41 @@ import {
   resolveGatewayHomeDir,
 } from '../src/config.js';
 
+test('loadConfig reads QQ config keys', async () => {
+  const prev = { ...process.env };
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-gateway-home-'));
+
+  try {
+    process.env.CLI_GATEWAY_HOME = tmp;
+
+    const file = configFilePath(resolveGatewayHomeDir());
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        {
+          qqAppId: 'qq-app',
+          qqClientSecret: 'qq-secret',
+          qqSandbox: true,
+          workspaceRoot: '/tmp/cli-gateway-test',
+          dbPath: 'data/test.db',
+        },
+        null,
+        2,
+      ) + '\n',
+      'utf8',
+    );
+
+    const cfg = await loadConfig();
+
+    assert.equal(cfg.qqAppId, 'qq-app');
+    assert.equal(cfg.qqClientSecret, 'qq-secret');
+    assert.equal(cfg.qqSandbox, true);
+  } finally {
+    process.env = prev;
+  }
+});
+
 test('loadConfig reads ~/.cli-gateway/config.json (via CLI_GATEWAY_HOME)', async () => {
   const prev = { ...process.env };
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-gateway-home-'));

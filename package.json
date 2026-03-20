@@ -52,6 +52,7 @@
       "src/channels/discord.ts",
       "src/channels/telegram.ts",
       "src/channels/feishu.ts",
+      "src/channels/qq.ts",
       "src/scheduler/scheduler.ts",
       "src/logging.ts",
       "dist/**"
@@ -69,7 +70,8 @@
     "agent-client-protocol",
     "discord",
     "telegram",
-    "feishu"
+    "feishu",
+    "qq"
   ],
   "author": "clawbot7",
   "dependencies": {
@@ -79,6 +81,7 @@
     "dotenv": "^16.6.1",
     "grammy": "^1.41.0",
     "node-cron": "^4.2.1",
+    "ws": "^8.18.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {

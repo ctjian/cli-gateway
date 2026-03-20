@@ -21,6 +21,35 @@ import {
   upsertBinding,
   type ConversationKey,
 } from '../src/gateway/sessionStore.js';
+import { QQ_ROUTE_C2C } from '../src/channels/qqClient.js';
+
+
+function createConfig(workspaceRoot: string) {
+  return {
+    discordToken: undefined,
+    discordAllowChannelId: undefined,
+    telegramToken: undefined,
+    feishuAppId: undefined,
+    feishuAppSecret: undefined,
+    feishuVerificationToken: undefined,
+    feishuListenPort: 3030,
+    qqAppId: undefined,
+    qqClientSecret: undefined,
+    qqSandbox: false,
+    acpAgentCommand: 'node',
+    acpAgentArgs: [],
+    workspaceRoot,
+    dbPath: ':memory:',
+    schedulerEnabled: false,
+    runtimeIdleTtlSeconds: 999,
+    maxBindingRuntimes: 5,
+    uiDefaultMode: 'verbose',
+    uiJsonMaxChars: 10_000,
+    contextReplayEnabled: false,
+    contextReplayRuns: 0,
+    contextReplayMaxChars: 0,
+  };
+}
 
 class FakeRpc implements StdioProcess {
   private messageHandlers: Array<(m: JsonRpcMessage) => void> = [];
@@ -151,22 +180,7 @@ test('router non-command flow creates run/events/checkpoint and uses global+repl
   const router = new GatewayRouter({
     db,
     config: {
-      discordToken: undefined,
-      discordAllowChannelId: undefined,
-      telegramToken: undefined,
-      feishuAppId: undefined,
-      feishuAppSecret: undefined,
-      feishuVerificationToken: undefined,
-      feishuListenPort: 3030,
-      acpAgentCommand: 'node',
-      acpAgentArgs: [],
-      workspaceRoot,
-      dbPath: ':memory:',
-      schedulerEnabled: false,
-      runtimeIdleTtlSeconds: 999,
-      maxBindingRuntimes: 5,
-      uiDefaultMode: 'verbose',
-      uiJsonMaxChars: 10_000,
+      ...createConfig(workspaceRoot),
       contextReplayEnabled: true,
       contextReplayRuns: 5,
       contextReplayMaxChars: 10_000,
@@ -246,27 +260,7 @@ test('router injects global context only on fresh sessions', async () => {
 
   const router = new GatewayRouter({
     db,
-    config: {
-      discordToken: undefined,
-      discordAllowChannelId: undefined,
-      telegramToken: undefined,
-      feishuAppId: undefined,
-      feishuAppSecret: undefined,
-      feishuVerificationToken: undefined,
-      feishuListenPort: 3030,
-      acpAgentCommand: 'node',
-      acpAgentArgs: [],
-      workspaceRoot,
-      dbPath: ':memory:',
-      schedulerEnabled: false,
-      runtimeIdleTtlSeconds: 999,
-      maxBindingRuntimes: 5,
-      uiDefaultMode: 'verbose',
-      uiJsonMaxChars: 10_000,
-      contextReplayEnabled: false,
-      contextReplayRuns: 0,
-      contextReplayMaxChars: 0,
-    } as any,
+    config: createConfig(workspaceRoot) as any,
     runtimeFactory: () =>
       ({
         hasSessionId: () => hasSessionAnswers.shift() ?? true,
@@ -326,27 +320,7 @@ test('router forwards image resources as prompt resource_link blocks', async () 
   const rpc = new FakeRpc();
   const router = new GatewayRouter({
     db,
-    config: {
-      discordToken: undefined,
-      discordAllowChannelId: undefined,
-      telegramToken: undefined,
-      feishuAppId: undefined,
-      feishuAppSecret: undefined,
-      feishuVerificationToken: undefined,
-      feishuListenPort: 3030,
-      acpAgentCommand: 'node',
-      acpAgentArgs: [],
-      workspaceRoot,
-      dbPath: ':memory:',
-      schedulerEnabled: false,
-      runtimeIdleTtlSeconds: 999,
-      maxBindingRuntimes: 5,
-      uiDefaultMode: 'verbose',
-      uiJsonMaxChars: 10_000,
-      contextReplayEnabled: false,
-      contextReplayRuns: 0,
-      contextReplayMaxChars: 0,
-    } as any,
+    config: createConfig(workspaceRoot) as any,
     runtimeFactory: (p) =>
       new BindingRuntime({
         ...p,
@@ -400,6 +374,80 @@ test('router forwards image resources as prompt resource_link blocks', async () 
   db.close();
 });
 
+
+
+test('router accepts qq attachment-only message when threadId encodes route kind', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync('/tmp/cli-gateway-router-');
+
+  const key: ConversationKey = {
+    platform: 'qq',
+    chatId: 'qq-user-openid',
+    threadId: QQ_ROUTE_C2C,
+    userId: 'qq-user-openid',
+  };
+
+  const rpc = new FakeRpc();
+  const router = new GatewayRouter({
+    db,
+    config: createConfig(workspaceRoot) as any,
+    runtimeFactory: (p) =>
+      new BindingRuntime({
+        ...p,
+        acpRpc: rpc,
+        workspaceRoot,
+      }),
+  });
+
+  const state = { text: '', messageId: 'm-qq' as string | null };
+  const sink = {
+    sendText: async (t: string) => {
+      state.text += t;
+    },
+    flush: async () => {},
+    getDeliveryState: () => state,
+  };
+
+  await router.handleUserMessage(key, '', sink as any, {
+    resources: [
+      {
+        uri: 'https://cdn.example.com/qq-image.png',
+        mimeType: 'image/png',
+      },
+    ],
+  });
+
+  assert.ok(state.text.includes('ok'));
+
+  const run = db
+    .prepare('SELECT prompt_text as promptText FROM runs ORDER BY started_at DESC LIMIT 1')
+    .get() as { promptText: string };
+  assert.equal(run.promptText, '[attachment] image');
+
+  const binding = db
+    .prepare(
+      'SELECT platform, chat_id as chatId, thread_id as threadId, user_id as userId FROM bindings LIMIT 1',
+    )
+    .get() as {
+      platform: string;
+      chatId: string;
+      threadId: string | null;
+      userId: string;
+    };
+  assert.deepEqual(binding, {
+    platform: 'qq',
+    chatId: 'qq-user-openid',
+    threadId: QQ_ROUTE_C2C,
+    userId: 'qq-user-openid',
+  });
+
+  router.close();
+  db.close();
+});
+
 test('router recycles runtime after ACP transport error', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
@@ -428,27 +476,7 @@ test('router recycles runtime after ACP transport error', async () => {
 
   const router = new GatewayRouter({
     db,
-    config: {
-      discordToken: undefined,
-      discordAllowChannelId: undefined,
-      telegramToken: undefined,
-      feishuAppId: undefined,
-      feishuAppSecret: undefined,
-      feishuVerificationToken: undefined,
-      feishuListenPort: 3030,
-      acpAgentCommand: 'node',
-      acpAgentArgs: [],
-      workspaceRoot,
-      dbPath: ':memory:',
-      schedulerEnabled: false,
-      runtimeIdleTtlSeconds: 999,
-      maxBindingRuntimes: 5,
-      uiDefaultMode: 'verbose',
-      uiJsonMaxChars: 10_000,
-      contextReplayEnabled: false,
-      contextReplayRuns: 0,
-      contextReplayMaxChars: 0,
-    } as any,
+    config: createConfig(workspaceRoot) as any,
     runtimeFactory: () =>
       ({
         close: () => {

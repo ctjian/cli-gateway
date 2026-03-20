@@ -2,6 +2,7 @@ import type { OutboundSink } from '../gateway/router.js';
 import type { Platform } from '../gateway/sessionStore.js';
 import type { DiscordController } from './discord.js';
 import type { TelegramController } from './telegram.js';
+import type { QQController } from './qq.js';
 
 export type SinkFactory = (
   platform: Platform,
@@ -13,6 +14,7 @@ export type SinkFactory = (
 export function createSinkFactory(params: {
   discord: DiscordController | null;
   telegram: TelegramController | null;
+  qq: QQController | null;
 }): SinkFactory {
   return (platform, chatId, threadId, userId) => {
     switch (platform) {
@@ -27,6 +29,11 @@ export function createSinkFactory(params: {
       case 'telegram': {
         if (!params.telegram) throw new Error('Telegram sink not available');
         return params.telegram.createSink(chatId, threadId, userId);
+      }
+
+      case 'qq': {
+        if (!params.qq) throw new Error('QQ sink not available');
+        return params.qq.createSink(chatId, threadId, userId);
       }
 
       default:
