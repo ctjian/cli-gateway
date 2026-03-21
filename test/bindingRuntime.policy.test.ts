@@ -222,7 +222,7 @@ test('BindingRuntime auto-allow policy bypasses interactive UI', async () => {
   });
 
   assert.equal(res.stopReason, 'end');
-  assert.ok(texts.some((t) => t.includes('auto-allowed')));
+  assert.equal(texts.length, 0);
   assert.ok(ui.some((e) => e.kind === 'task'));
 
   rt.close();
@@ -382,7 +382,7 @@ test('BindingRuntime auto-allow resolves tool kind from title fallback', async (
   });
 
   assert.equal(res.stopReason, 'end');
-  assert.ok(texts.some((t) => t.includes('auto-allowed (other)')));
+  assert.equal(texts.length, 0);
 
   rt.close();
   db.close();

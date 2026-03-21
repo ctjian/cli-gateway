@@ -207,15 +207,6 @@ export class BindingRuntime {
                 });
                 this.pendingPermission = null;
                 this.pendingPermissionActorUserId = null;
-                this.enqueueSinkWrite(async () => {
-                  const sink = this.activeSink;
-                  if (!sink) return;
-                  await sink.sendText(
-                    formatTextCodeBlock(
-                      `[permission] auto-allowed (${toolKind})`,
-                    ),
-                  );
-                });
                 return;
               }
             }
