@@ -626,10 +626,14 @@ export class BindingRuntime {
 
     if (toolCallId) {
       const existingTitle = this.toolCallTitles.get(toolCallId);
-      if (!existingTitle && baseTitle) {
+      if (existingTitle) {
+        if (isToolTitleMoreInformative(baseTitle, existingTitle)) {
+          this.toolCallTitles.set(toolCallId, baseTitle);
+        } else {
+          baseTitle = existingTitle;
+        }
+      } else if (baseTitle && !isOpaqueToolTitle(baseTitle)) {
         this.toolCallTitles.set(toolCallId, baseTitle);
-      } else if (existingTitle) {
-        baseTitle = existingTitle;
       }
     }
 
@@ -704,6 +708,46 @@ function renderJson(value: unknown, maxChars: number): string {
   } catch {
     return String(value);
   }
+}
+
+function isOpaqueToolTitle(title: string): boolean {
+  const trimmed = title.trim();
+  if (!trimmed) return true;
+  const lowered = trimmed.toLowerCase();
+  return (
+    lowered === 'tool_call' ||
+    lowered === 'terminal' ||
+    lowered === 'execute' ||
+    lowered === 'undefined' ||
+    lowered === '"undefined"' ||
+    lowered.startsWith('call_')
+  );
+}
+
+function toolTitleInfoScore(title: string): number {
+  const trimmed = title.trim();
+  if (!trimmed) return 0;
+  if (isOpaqueToolTitle(trimmed)) return 1;
+
+  let score = 10;
+  if (trimmed.includes(':')) score += 8;
+  if (trimmed.includes('`')) score += 8;
+  if (trimmed.includes('/')) score += 4;
+  if (/\b(run|read|edit|search|fetch|move|delete)\b:/i.test(trimmed)) score += 8;
+
+  score += Math.min(24, Math.floor(trimmed.length / 12));
+  return score;
+}
+
+function isToolTitleMoreInformative(candidate: string, current: string): boolean {
+  const candidateScore = toolTitleInfoScore(candidate);
+  const currentScore = toolTitleInfoScore(current);
+
+  if (candidateScore !== currentScore) {
+    return candidateScore > currentScore;
+  }
+
+  return candidate.trim().length > current.trim().length;
 }
 
 function normalizeSummaryToolTitle(
@@ -972,7 +1016,14 @@ function truncateInline(text: string, maxLen: number): string {
 }
 
 function summarizeToolFallbackFromUpdate(update: any): string | null {
-  const kind = extractFirstString(update, ['kind', 'tool', 'toolName', 'name']);
+  const kind = extractFirstString(update, [
+    'kind',
+    'tool',
+    'toolName',
+    'name',
+    'method',
+    'rawInput.method',
+  ]);
   const command = extractCommandHint(update);
   const path = extractPathHint(update);
   const query = extractSearchHint(update);
@@ -1048,7 +1099,10 @@ function extractCommandHint(update: any): string | null {
     'command',
     'cmd',
     'input.command',
+    'input.params.command',
+    'rawInput.params.command',
     'arguments.command',
+    'arguments.params.command',
     'result.command',
   ]);
   if (!command) return null;
@@ -1056,7 +1110,10 @@ function extractCommandHint(update: any): string | null {
   const args = extractStringArray(update, [
     'args',
     'input.args',
+    'input.params.args',
+    'rawInput.params.args',
     'arguments.args',
+    'arguments.params.args',
     'result.args',
   ]);
   return args.length > 0 ? `${command} ${args.join(' ')}` : command;

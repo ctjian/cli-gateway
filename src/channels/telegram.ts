@@ -434,6 +434,8 @@ function dispatchTelegramInbound(params: {
   const remapped = remapTelegramInlineCommand(rawText, inlineCommands);
   const normalizedText = remapped.startsWith('/start') ? '/help' : remapped;
   const isCommand = normalizedText.startsWith('/');
+  const shouldEnableTyping =
+    !isCommand || !isFastTelegramLocalCommand(normalizedText);
 
   const sink = isCommand
     ? createTelegramCommandSink(
@@ -468,7 +470,7 @@ function dispatchTelegramInbound(params: {
     token: config.telegramToken,
     chatId,
     threadId: threadId ? Number(threadId) : null,
-    enabled: !isCommand,
+    enabled: shouldEnableTyping,
   });
 
   // IMPORTANT: do not await; grammY processes updates sequentially.
@@ -869,6 +871,34 @@ function truncateTelegramDescription(text: string): string {
   return trimmed.slice(0, 253) + '...';
 }
 
+function isFastTelegramLocalCommand(text: string): boolean {
+  const parts = text.trim().split(/\s+/).filter(Boolean);
+  const first = (parts[0] ?? '').toLowerCase();
+  const at = first.indexOf('@');
+  const cmd = at > 1 && first.startsWith('/') ? first.slice(0, at) : first;
+  const sub = parts[1] ?? '';
+
+  if (cmd === '/help' || cmd === '/start' || cmd === '/ui') return true;
+
+  if (cmd === '/cli') {
+    return !sub || sub === 'show';
+  }
+
+  if (cmd === '/whitelist' || cmd === '/wl') {
+    return !sub || sub === 'list' || sub === 'show';
+  }
+
+  if (cmd === '/trust') {
+    return !sub || sub === 'status' || sub === 'show';
+  }
+
+  if (cmd === '/cron') {
+    return !sub || sub === 'help' || sub === 'list';
+  }
+
+  return false;
+}
+
 export function splitTelegramMessageChunks(
   text: string,
   maxLen = TELEGRAM_TEXT_LIMIT,
@@ -904,6 +934,7 @@ export function createTelegramCommandSink(
   userId: string,
   buildPermissionCallbackData: (req: PermissionUiRequest) => {
     allowData: string;
+    allowAlwaysData?: string;
     denyData: string;
   },
 ): OutboundSink & { flush: () => Promise<void> } {
@@ -949,10 +980,13 @@ export function createTelegramCommandSink(
       }
     },
     requestPermission: async (req) => {
-      const { allowData, denyData } = buildPermissionCallbackData(req);
-      const keyboard = new InlineKeyboard()
-        .text('✅ Allow', allowData)
-        .text('❌ Deny', denyData);
+      const { allowData, allowAlwaysData, denyData } =
+        buildPermissionCallbackData(req);
+      const keyboard = new InlineKeyboard().text('✅ Once', allowData);
+      if (allowAlwaysData) {
+        keyboard.text('🔓 Always', allowAlwaysData);
+      }
+      keyboard.text('❌ Deny', denyData);
 
       const toolKind = req.toolKind ? ` (${req.toolKind})` : '';
       const prefix =
