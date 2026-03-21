@@ -1,10 +1,18 @@
 import { InlineKeyboard, type Bot } from 'grammy';
 
 import type { OutboundSink } from '../gateway/router.js';
-import type { UiEvent } from '../gateway/types.js';
+import type { PermissionUiRequest, UiEvent } from '../gateway/types.js';
 import { createBufferedSink } from './bufferedSink.js';
 
 type ToolUiEvent = Extract<UiEvent, { kind: 'tool' }>;
+type TelegramPermissionCallbackData = {
+  allowData: string;
+  allowAlwaysData?: string;
+  denyData: string;
+};
+type BuildTelegramPermissionCallbackData = (
+  req: PermissionUiRequest,
+) => TelegramPermissionCallbackData;
 
 export function createTelegramSink(
   bot: Bot,
@@ -14,11 +22,14 @@ export function createTelegramSink(
   userId: string,
   opts?: {
     flushIntervalMs?: number;
+    buildPermissionCallbackData?: BuildTelegramPermissionCallbackData;
   },
 ): OutboundSink & { flush: () => Promise<void> } {
   const isPrivateChat = chatId > 0;
   const toolUiMessageById = new Map<string, number>();
   let toolUiFallbackSeq = 0;
+  const buildPermissionCallbackData =
+    opts?.buildPermissionCallbackData ?? defaultTelegramPermissionCallbackData;
 
   if (!isPrivateChat) {
     const buffered = createBufferedSink({
@@ -45,17 +56,21 @@ export function createTelegramSink(
       flush: buffered.flush,
       getDeliveryState: buffered.getState,
       requestPermission: async (req) => {
-        const allowData = `acpperm:${req.sessionKey}:${req.requestId}:allow`;
-        const denyData = `acpperm:${req.sessionKey}:${req.requestId}:deny`;
+        const { allowData, allowAlwaysData, denyData } = buildPermissionCallbackData(req);
 
-        const keyboard = new InlineKeyboard()
-          .text('✅ Allow', allowData)
-          .text('❌ Deny', denyData);
+        const keyboard = new InlineKeyboard().text('✅ Once', allowData);
+        if (allowAlwaysData) {
+          keyboard.text('🔓 Always', allowAlwaysData);
+        }
+        keyboard.text('❌ Deny', denyData);
 
         const toolKind = req.toolKind ? ` (${req.toolKind})` : '';
-        const prefix =
-          req.uiMode === 'summary' ? '[permission]' : 'Permission required:';
-        const text = `${prefix} ${req.toolTitle}${toolKind}. Only user ${userId} can approve.`;
+        const reqShort = String(req.requestId ?? '').slice(0, 8) || 'unknown';
+        const text = [
+          `Permission: ${req.toolTitle}${toolKind}`,
+          `request=${reqShort}`,
+          `Only user ${userId} can approve.`,
+        ].join('\n');
 
         await bot.api.sendMessage(chatId, escapeHtml(text), {
           message_thread_id: threadId ?? undefined,
@@ -130,17 +145,21 @@ export function createTelegramSink(
     },
     getDeliveryState: agentBuffered.getState,
     requestPermission: async (req) => {
-      const allowData = `acpperm:${req.sessionKey}:${req.requestId}:allow`;
-      const denyData = `acpperm:${req.sessionKey}:${req.requestId}:deny`;
+      const { allowData, allowAlwaysData, denyData } = buildPermissionCallbackData(req);
 
-      const keyboard = new InlineKeyboard()
-        .text('✅ Allow', allowData)
-        .text('❌ Deny', denyData);
+      const keyboard = new InlineKeyboard().text('✅ Once', allowData);
+      if (allowAlwaysData) {
+        keyboard.text('🔓 Always', allowAlwaysData);
+      }
+      keyboard.text('❌ Deny', denyData);
 
       const toolKind = req.toolKind ? ` (${req.toolKind})` : '';
-      const prefix =
-        req.uiMode === 'summary' ? '[permission]' : 'Permission required:';
-      const msgText = `${prefix} ${req.toolTitle}${toolKind}. Only user ${userId} can approve.`;
+      const reqShort = String(req.requestId ?? '').slice(0, 8) || 'unknown';
+      const msgText = [
+        `Permission: ${req.toolTitle}${toolKind}`,
+        `request=${reqShort}`,
+        `Only user ${userId} can approve.`,
+      ].join('\n');
 
       await bot.api.sendMessage(chatId, escapeHtml(msgText), {
         message_thread_id: threadId ?? undefined,
@@ -228,6 +247,16 @@ function formatToolUiText(event: ToolUiEvent): string {
       : header;
   const code = escapeHtml(truncate(content, 3300));
   return `<pre><code>${code}</code></pre>`;
+}
+
+function defaultTelegramPermissionCallbackData(
+  req: PermissionUiRequest,
+): TelegramPermissionCallbackData {
+  return {
+    allowData: `acpperm:${req.sessionKey}:${req.requestId}:allow`,
+    allowAlwaysData: `acpperm:${req.sessionKey}:${req.requestId}:allow_prefix`,
+    denyData: `acpperm:${req.sessionKey}:${req.requestId}:deny`,
+  };
 }
 
 function truncate(text: string, maxLen: number): string {

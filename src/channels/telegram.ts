@@ -1,4 +1,5 @@
-import { Bot } from 'grammy';
+import { randomUUID } from 'node:crypto';
+import { Bot, InlineKeyboard } from 'grammy';
 
 import type {
   CliInlineCommand,
@@ -8,6 +9,7 @@ import type {
 } from '../gateway/router.js';
 import type { AppConfig } from '../config.js';
 import { log } from '../logging.js';
+import type { PermissionUiRequest } from '../gateway/types.js';
 import {
   SHARED_CHAT_SCOPE_USER_ID,
   type ConversationKey,
@@ -18,7 +20,7 @@ import {
   toTelegramCommandName,
 } from '../gateway/commandCatalog.js';
 import { createTelegramSink } from './telegramSink.js';
-import { setChatMenuButton, sendChatAction, setMessageReaction } from './telegramApi.js';
+import { setChatMenuButton, sendChatAction } from './telegramApi.js';
 
 export type TelegramController = {
   createSink: (
@@ -28,9 +30,32 @@ export type TelegramController = {
   ) => OutboundSink & { flush: () => Promise<void> };
 };
 
+const TELEGRAM_PERMISSION_CALLBACK_PREFIX = 'acpperm';
+const TELEGRAM_PERMISSION_CALLBACK_TTL_MS = 30 * 60 * 1000;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 650;
 const TELEGRAM_TYPING_INTERVAL_MS = 4000;
 const TELEGRAM_TEXT_LIMIT = 4096;
+
+type TelegramPermissionDecision = 'allow' | 'allow_prefix' | 'deny';
+export type ParsedTelegramPermissionCallbackData =
+  | {
+      kind: 'token';
+      token: string;
+      decision: TelegramPermissionDecision;
+    }
+  | {
+      kind: 'legacy';
+      sessionKey: string;
+      requestId: string;
+      decision: TelegramPermissionDecision;
+    };
+type PendingTelegramPermission = {
+  sessionKey: string;
+  requestId: string;
+  actorUserId: string;
+  createdAt: number;
+};
+
 
 type PendingTelegramMediaGroup = {
   chatId: number;
@@ -57,6 +82,7 @@ export async function startTelegram(
   const bot = new Bot(config.telegramToken);
   const chatCommandSignatures = new Map<number, string>();
   const pendingMediaGroups = new Map<string, PendingTelegramMediaGroup>();
+  const pendingPermissions = new Map<string, PendingTelegramPermission>();
 
   const tgCommands = listTelegramBuiltinCommands();
 
@@ -79,6 +105,15 @@ export async function startTelegram(
     log.warn('Telegram setChatMenuButton(default) error', err),
   );
 
+  const buildPermissionCallbackDataForActor =
+    (actorUserId: string) =>
+    (req: PermissionUiRequest) =>
+      createTelegramPermissionCallbackData({
+        req,
+        actorUserId,
+        pendingPermissions,
+      });
+
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data ?? '';
 
@@ -89,56 +124,65 @@ export async function startTelegram(
       // ignore
     }
 
-    if (!data.startsWith('acpperm:')) return;
+    const parsed = parseTelegramPermissionCallbackData(data);
+    if (!parsed) return;
+
+    let res: { ok: boolean; message: string } = {
+      ok: false,
+      message: 'Permission request expired.',
+    };
+    let shouldClearMarkup = false;
 
     try {
-      const parts = data.split(':');
-      const sessionKey = parts[1] ?? '';
-      const requestId = parts[2] ?? '';
-      const decision = parts[3] ?? '';
-
-      if (!sessionKey || !requestId || (decision !== 'allow' && decision !== 'deny')) {
-        return;
-      }
-
       const actorUserId = String(ctx.from?.id ?? '');
 
-      const res = await router.handlePermissionUi({
-        platform: 'telegram',
-        sessionKey,
-        requestId,
-        decision,
-        actorUserId,
-      });
+      if (parsed.kind === 'token') {
+        pruneExpiredTelegramPermissions(pendingPermissions);
+        const pending = pendingPermissions.get(parsed.token);
+
+        if (!pending) {
+          shouldClearMarkup = true;
+        } else if (
+          isTelegramPermissionActorRestricted(pending.actorUserId) &&
+          pending.actorUserId !== actorUserId
+        ) {
+          res = { ok: false, message: 'Not authorized.' };
+        } else {
+          res = await router.handlePermissionUi({
+            platform: 'telegram',
+            sessionKey: pending.sessionKey,
+            requestId: pending.requestId,
+            decision: parsed.decision,
+            actorUserId,
+          });
+
+          shouldClearMarkup = shouldFinalizeTelegramPermissionResult(res);
+          if (shouldClearMarkup) {
+            pendingPermissions.delete(parsed.token);
+          }
+        }
+      } else {
+        res = await router.handlePermissionUi({
+          platform: 'telegram',
+          sessionKey: parsed.sessionKey,
+          requestId: parsed.requestId,
+          decision: parsed.decision,
+          actorUserId,
+        });
+        shouldClearMarkup = shouldFinalizeTelegramPermissionResult(res);
+      }
 
       const msg = ctx.callbackQuery.message;
-      if (msg) {
-        const emoji = decision === 'allow' ? '👍' : '👎';
-        void setMessageReaction(
-          config.telegramToken,
-          {
-            chatId: msg.chat.id,
-            messageId: msg.message_id,
-            emoji,
-            isBig: false,
-          },
-          fetch,
-        ).catch(() => {
+      if (msg && shouldClearMarkup) {
+        try {
+          await bot.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, {
+            reply_markup: { inline_keyboard: [] },
+          });
+        } catch {
           // ignore
-        });
-
-        if (res.ok) {
-          try {
-            await bot.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, {
-              reply_markup: { inline_keyboard: [] },
-            });
-          } catch {
-            // ignore
-          }
         }
       }
 
-      // Visible confirmation.
       try {
         await ctx.reply(res.message);
       } catch (error) {
@@ -187,6 +231,7 @@ export async function startTelegram(
               config,
               tgCommands,
               chatCommandSignatures,
+              pendingPermissions,
               chatId: group.chatId,
               chatType: group.chatType,
               userId: group.userId,
@@ -194,7 +239,6 @@ export async function startTelegram(
               threadId: group.threadId,
               rawText: mergeTelegramTexts(group.texts),
               resources: dedupeTelegramResources(group.resources),
-              reactionMessageIds: dedupeTelegramMessageIds(group.messageIds),
               mediaGroupId: group.mediaGroupId,
             }),
         });
@@ -208,6 +252,7 @@ export async function startTelegram(
         config,
         tgCommands,
         chatCommandSignatures,
+        pendingPermissions,
         chatId: ctx.chat.id,
         chatType: ctx.chat.type,
         userId: String(ctx.from?.id ?? 'unknown'),
@@ -217,7 +262,6 @@ export async function startTelegram(
           : null,
         rawText,
         resources,
-        reactionMessageIds: [Number(message.message_id)],
       });
     } catch (error) {
       log.error('Telegram message handler error', error);
@@ -238,6 +282,9 @@ export async function startTelegram(
         Number(chatId),
         threadId ? Number(threadId) : null,
         userId,
+        {
+          buildPermissionCallbackData: buildPermissionCallbackDataForActor(userId),
+        },
       ),
   };
 }
@@ -318,6 +365,7 @@ function dispatchTelegramInbound(params: {
   config: AppConfig;
   tgCommands: Array<{ command: string; description: string }>;
   chatCommandSignatures: Map<number, string>;
+  pendingPermissions: Map<string, PendingTelegramPermission>;
   chatId: number;
   chatType: string;
   userId: string;
@@ -325,7 +373,6 @@ function dispatchTelegramInbound(params: {
   threadId: string | null;
   rawText: string;
   resources: UserResource[];
-  reactionMessageIds: number[];
   mediaGroupId?: string;
 }): void {
   const {
@@ -334,6 +381,7 @@ function dispatchTelegramInbound(params: {
     config,
     tgCommands,
     chatCommandSignatures,
+    pendingPermissions,
     chatId,
     chatType,
     userId,
@@ -341,10 +389,8 @@ function dispatchTelegramInbound(params: {
     threadId,
     rawText,
     resources,
-    reactionMessageIds,
     mediaGroupId,
   } = params;
-  const messageIds = dedupeTelegramMessageIds(reactionMessageIds);
   const normalizedResources = dedupeTelegramResources(resources);
 
   if (!rawText.trim() && normalizedResources.length === 0) return;
@@ -355,7 +401,7 @@ function dispatchTelegramInbound(params: {
     text: rawText.slice(0, 120),
     imageCount: normalizedResources.length,
     mediaGroupId,
-    groupedMessageCount: messageIds.length,
+    groupedMessageCount: 0,
   });
 
   // Per-chat: ensure menu button is commands.
@@ -390,23 +436,33 @@ function dispatchTelegramInbound(params: {
   const isCommand = normalizedText.startsWith('/');
 
   const sink = isCommand
-    ? createTelegramCommandSink(bot, chatId, threadId ? Number(threadId) : null)
+    ? createTelegramCommandSink(
+        bot,
+        chatId,
+        threadId ? Number(threadId) : null,
+        userId,
+        (req) =>
+          createTelegramPermissionCallbackData({
+            req,
+            actorUserId: userId,
+            pendingPermissions,
+          }),
+      )
     : createTelegramSink(
         bot,
         config.telegramToken,
         chatId,
         threadId ? Number(threadId) : null,
         userId,
+        {
+          buildPermissionCallbackData: (req) =>
+            createTelegramPermissionCallbackData({
+              req,
+              actorUserId: userId,
+              pendingPermissions,
+            }),
+        },
       );
-
-  void updateTelegramMessageReactions(
-    config.telegramToken,
-    chatId,
-    messageIds,
-    '🤔',
-  ).catch(() => {
-    // ignore
-  });
 
   const stopTyping = startTelegramTyping({
     token: config.telegramToken,
@@ -426,12 +482,6 @@ function dispatchTelegramInbound(params: {
   void p
     .then(async () => {
       stopTyping();
-      await updateTelegramMessageReactions(
-        config.telegramToken,
-        chatId,
-        messageIds,
-        '🕊',
-      );
 
       // Commands may change after this run (available_commands_update).
       void syncTelegramCommandsForChat({
@@ -447,42 +497,7 @@ function dispatchTelegramInbound(params: {
     .catch(async (error) => {
       stopTyping();
       log.error('Telegram router handler error', error);
-      try {
-        await updateTelegramMessageReactions(
-          config.telegramToken,
-          chatId,
-          messageIds,
-          '😢',
-        );
-      } catch {
-        // ignore
-      }
     });
-}
-
-async function updateTelegramMessageReactions(
-  token: string,
-  chatId: number,
-  messageIds: number[],
-  emoji: string,
-): Promise<void> {
-  const ids = dedupeTelegramMessageIds(messageIds);
-  if (ids.length === 0) return;
-
-  await Promise.allSettled(
-    ids.map((messageId) =>
-      setMessageReaction(
-        token,
-        {
-          chatId,
-          messageId,
-          emoji,
-          isBig: false,
-        },
-        fetch,
-      ),
-    ),
-  );
 }
 
 async function sendTelegramTyping(params: {
@@ -532,16 +547,18 @@ function startTelegramTyping(params: {
 }
 
 async function startLongPolling(bot: Bot): Promise<void> {
+  let firstBoot = true;
+
   for (;;) {
     try {
-      await bot.api.deleteWebhook({ drop_pending_updates: true });
+      await bot.api.deleteWebhook({ drop_pending_updates: firstBoot });
     } catch (err) {
       log.warn('Telegram deleteWebhook error', err);
     }
 
     log.info('Telegram long polling start', {
       allowedUpdates: ['message', 'callback_query'],
-      dropPendingUpdates: true,
+      dropPendingUpdates: firstBoot,
     });
 
     try {
@@ -553,12 +570,109 @@ async function startLongPolling(bot: Bot): Promise<void> {
       log.error('Telegram polling error; restarting in 2s', err);
     }
 
+    firstBoot = false;
     await sleep(2000);
   }
 }
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function parseTelegramPermissionCallbackData(
+  data: string,
+): ParsedTelegramPermissionCallbackData | null {
+  if (!data.startsWith(`${TELEGRAM_PERMISSION_CALLBACK_PREFIX}:`)) return null;
+
+  const parts = data.split(':');
+  if (parts.length !== 4) return null;
+
+  if (parts[1] === 't') {
+    const token = parts[2] ?? '';
+    const decision = shortTelegramPermissionDecision(parts[3]);
+    if (!token || !decision) return null;
+    return { kind: 'token', token, decision };
+  }
+
+  const sessionKey = parts[1] ?? '';
+  const requestId = parts[2] ?? '';
+  const decision = longTelegramPermissionDecision(parts[3]);
+  if (!sessionKey || !requestId || !decision) return null;
+  return { kind: 'legacy', sessionKey, requestId, decision };
+}
+
+function createTelegramPermissionCallbackData(params: {
+  req: PermissionUiRequest;
+  actorUserId: string;
+  pendingPermissions: Map<string, PendingTelegramPermission>;
+}): { allowData: string; allowAlwaysData: string; denyData: string } {
+  pruneExpiredTelegramPermissions(params.pendingPermissions);
+
+  const token = createTelegramPermissionToken();
+  params.pendingPermissions.set(token, {
+    sessionKey: params.req.sessionKey,
+    requestId: params.req.requestId,
+    actorUserId: params.actorUserId,
+    createdAt: Date.now(),
+  });
+
+  return {
+    allowData: `${TELEGRAM_PERMISSION_CALLBACK_PREFIX}:t:${token}:a`,
+    allowAlwaysData: `${TELEGRAM_PERMISSION_CALLBACK_PREFIX}:t:${token}:p`,
+    denyData: `${TELEGRAM_PERMISSION_CALLBACK_PREFIX}:t:${token}:d`,
+  };
+}
+
+function createTelegramPermissionToken(): string {
+  return randomUUID().replaceAll('-', '').slice(0, 20);
+}
+
+function pruneExpiredTelegramPermissions(
+  pendingPermissions: Map<string, PendingTelegramPermission>,
+): void {
+  if (pendingPermissions.size === 0) return;
+
+  const expiresBefore = Date.now() - TELEGRAM_PERMISSION_CALLBACK_TTL_MS;
+  for (const [token, pending] of pendingPermissions.entries()) {
+    if (pending.createdAt >= expiresBefore) continue;
+    pendingPermissions.delete(token);
+  }
+}
+
+function shouldFinalizeTelegramPermissionResult(res: {
+  ok: boolean;
+  message: string;
+}): boolean {
+  if (res.ok) return true;
+  return [
+    'Permission request expired.',
+    'No pending permission request.',
+    'No active runtime. Send a message first.',
+    'Unknown session binding.',
+  ].includes(res.message);
+}
+
+function isTelegramPermissionActorRestricted(actorUserId: string): boolean {
+  const normalized = actorUserId.trim();
+  return normalized !== '' && normalized !== 'unknown';
+}
+
+function shortTelegramPermissionDecision(
+  raw: string,
+): TelegramPermissionDecision | null {
+  if (raw === 'a') return 'allow';
+  if (raw === 'p') return 'allow_prefix';
+  if (raw === 'A') return 'allow_prefix'; // backward compatibility
+  if (raw === 'd') return 'deny';
+  return null;
+}
+
+function longTelegramPermissionDecision(
+  raw: string,
+): TelegramPermissionDecision | null {
+  if (raw === 'allow' || raw === 'allow_prefix' || raw === 'deny') return raw;
+  if (raw === 'allow_always') return 'allow_prefix'; // backward compatibility
+  return null;
 }
 
 export function remapTelegramInlineCommand(
@@ -776,12 +890,40 @@ export function splitTelegramMessageChunks(
   return chunks;
 }
 
-function createTelegramCommandSink(
+function escapeTelegramHtml(text: string): string {
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+export function createTelegramCommandSink(
   bot: Bot,
   chatId: number,
   threadId: number | null,
+  userId: string,
+  buildPermissionCallbackData: (req: PermissionUiRequest) => {
+    allowData: string;
+    denyData: string;
+  },
 ): OutboundSink & { flush: () => Promise<void> } {
   let text = '';
+
+  const sendChunkWithRetry = async (chunk: string): Promise<void> => {
+    try {
+      await bot.api.sendMessage(chatId, chunk, {
+        message_thread_id: threadId ?? undefined,
+      });
+      return;
+    } catch (error) {
+      log.warn('telegram command chunk send failed (attempt 1)', error);
+    }
+
+    await sleep(250);
+    await bot.api.sendMessage(chatId, chunk, {
+      message_thread_id: threadId ?? undefined,
+    });
+  };
 
   return {
     sendText: async (delta: string) => {
@@ -789,13 +931,39 @@ function createTelegramCommandSink(
     },
     flush: async () => {
       const out = text.trim();
-      text = '';
       if (!out) return;
-      for (const chunk of splitTelegramMessageChunks(out)) {
-        await bot.api.sendMessage(chatId, chunk, {
-          message_thread_id: threadId ?? undefined,
-        });
+
+      const chunks = splitTelegramMessageChunks(out);
+      let sentCount = 0;
+
+      for (const chunk of chunks) {
+        if (!chunk) continue;
+        await sendChunkWithRetry(chunk);
+        sentCount += 1;
       }
+
+      if (sentCount >= chunks.length) {
+        text = '';
+      } else {
+        text = chunks.slice(sentCount).join('\n');
+      }
+    },
+    requestPermission: async (req) => {
+      const { allowData, denyData } = buildPermissionCallbackData(req);
+      const keyboard = new InlineKeyboard()
+        .text('✅ Allow', allowData)
+        .text('❌ Deny', denyData);
+
+      const toolKind = req.toolKind ? ` (${req.toolKind})` : '';
+      const prefix =
+        req.uiMode === 'summary' ? '[permission]' : 'Permission required:';
+      const msgText = `${prefix} ${req.toolTitle}${toolKind}. Only user ${userId} can approve.`;
+
+      await bot.api.sendMessage(chatId, escapeTelegramHtml(msgText), {
+        message_thread_id: threadId ?? undefined,
+        reply_markup: keyboard,
+        parse_mode: 'HTML',
+      });
     },
     sendUi: async (event) => {
       const header = `[${event.kind}] ${event.title}`;

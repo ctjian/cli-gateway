@@ -389,7 +389,7 @@ export class BindingRuntime {
   }
 
   async decidePermission(params: {
-    decision: 'allow' | 'deny';
+    decision: 'allow' | 'allow_always' | 'allow_prefix' | 'deny';
     requestId?: string;
     actorUserId?: string;
   }): Promise<{ ok: boolean; message: string }> {
@@ -415,11 +415,40 @@ export class BindingRuntime {
     const rejectAlways = pr.params.options.find((o) => o.kind === 'reject_always');
 
     const selected =
-      params.decision === 'allow'
-        ? (allowOnce ?? allowAlways)
-        : (rejectOnce ?? rejectAlways);
+      params.decision === 'allow_always'
+        ? (allowAlways ?? allowOnce)
+        : params.decision === 'allow' || params.decision === 'allow_prefix'
+          ? (allowOnce ?? allowAlways)
+          : (rejectOnce ?? rejectAlways);
 
-    if (selected && toolKind && selected.kind === 'allow_always') {
+    let prefixApplied = false;
+
+    if (params.decision === 'allow_prefix' && toolKind) {
+      const method =
+        typeof pr.params.toolCall?.rawInput?.method === 'string'
+          ? pr.params.toolCall.rawInput.method
+          : undefined;
+      const rawParams = pr.params.toolCall?.rawInput?.params;
+      const prefix = extractAllowPrefixFromPermission(
+        toolKind,
+        method,
+        rawParams,
+        pr.params.toolCall,
+      );
+      if (prefix) {
+        // Keep "Always" strictly scoped: persist prefix allow and remove broad allow.
+        this.toolAuth.clearPersistentPolicy(this.bindingKey, toolKind, 'allow');
+        this.toolAuth.setAllowPrefixRule(this.bindingKey, toolKind, prefix);
+        prefixApplied = true;
+      }
+    }
+
+    if (
+      selected &&
+      toolKind &&
+      selected.kind === 'allow_always' &&
+      params.decision !== 'allow_prefix'
+    ) {
       this.toolAuth.setPersistentPolicy(this.bindingKey, toolKind, 'allow');
     }
 
@@ -443,8 +472,14 @@ export class BindingRuntime {
         ok: true,
         message:
           params.decision === 'allow'
-            ? 'OK: allowed.'
-            : 'OK: denied.',
+            ? 'OK: allowed once.'
+            : params.decision === 'allow_always'
+              ? 'OK: allowed by policy.'
+              : params.decision === 'allow_prefix'
+                ? (prefixApplied
+                    ? 'OK: allowed by prefix policy.'
+                    : 'OK: allowed once (prefix unavailable).')
+                : 'OK: denied.',
       };
     }
 
@@ -580,9 +615,14 @@ export class BindingRuntime {
 
     let baseTitle =
       this.currentUiMode === 'summary'
-        ? normalizeSummaryToolTitle(rawTitle, inferredActions)
-        : normalizeVerboseToolTitle(rawTitle, inferredActions);
-    if (!baseTitle) return null;
+        ? normalizeSummaryToolTitle(rawTitle, inferredActions, update)
+        : normalizeVerboseToolTitle(rawTitle, inferredActions, update);
+
+    if (!baseTitle) {
+      const fallback = summarizeToolFallbackFromUpdate(update);
+      if (!fallback) return null;
+      baseTitle = fallback;
+    }
 
     if (toolCallId) {
       const existingTitle = this.toolCallTitles.get(toolCallId);
@@ -669,16 +709,25 @@ function renderJson(value: unknown, maxChars: number): string {
 function normalizeSummaryToolTitle(
   title: string,
   inferredActions: ToolAction[],
+  update?: any,
 ): string | null {
   const inferredTitle = summarizeInferredActions(inferredActions, 86);
   if (inferredTitle) return inferredTitle;
 
   const trimmed = title.trim();
-  if (!trimmed) return null;
   const lowered = trimmed.toLowerCase();
-  if (lowered === 'tool_call') return null;
-  if (lowered.startsWith('call_')) return null;
-  if (!/[a-z]/i.test(trimmed)) return null;
+
+  const isInvalidTitle =
+    !trimmed ||
+    lowered === 'tool_call' ||
+    lowered === 'undefined' ||
+    lowered === '"undefined"' ||
+    lowered.startsWith('call_') ||
+    !/[a-z]/i.test(trimmed);
+
+  if (isInvalidTitle) {
+    return summarizeToolFallbackFromUpdate(update);
+  }
 
   // Keep explicit tool method names when available.
   const explicitMethod = trimmed.match(
@@ -692,12 +741,24 @@ function normalizeSummaryToolTitle(
 function normalizeVerboseToolTitle(
   title: string,
   inferredActions: ToolAction[],
+  update?: any,
 ): string {
   const inferredTitle = summarizeInferredActions(inferredActions, 96);
   if (inferredTitle) return inferredTitle;
 
   const trimmed = title.trim();
-  return trimmed || 'tool_call';
+  if (trimmed) {
+    const lowered = trimmed.toLowerCase();
+    if (
+      lowered !== 'tool_call' &&
+      lowered !== 'undefined' &&
+      lowered !== '"undefined"'
+    ) {
+      return trimmed;
+    }
+  }
+
+  return summarizeToolFallbackFromUpdate(update) ?? 'tool_call';
 }
 
 function inferToolStage(update: any): ToolUiStage {
@@ -910,6 +971,24 @@ function truncateInline(text: string, maxLen: number): string {
   return clean.slice(0, maxLen - 3) + '...';
 }
 
+function summarizeToolFallbackFromUpdate(update: any): string | null {
+  const kind = extractFirstString(update, ['kind', 'tool', 'toolName', 'name']);
+  const command = extractCommandHint(update);
+  const path = extractPathHint(update);
+  const query = extractSearchHint(update);
+
+  const actionHint = command ?? path ?? query ?? null;
+
+  if (kind && actionHint) {
+    return `${kind}: ${truncateInline(actionHint, 96)}`;
+  }
+
+  if (kind) return kind;
+  if (actionHint) return truncateInline(actionHint, 96);
+
+  return null;
+}
+
 function buildToolDetailText(params: {
   update: any;
   rawTitle: string;
@@ -1111,6 +1190,41 @@ function resolvePermissionToolArgs(toolCall: unknown): unknown {
   }
   if (direct !== undefined && direct !== null) return direct;
   return Object.keys(remainder).length > 0 ? remainder : null;
+}
+
+function extractAllowPrefixFromPermission(
+  toolKind: ToolKind,
+  method: string | undefined,
+  rawParams: unknown,
+  toolCall: unknown,
+): string | null {
+  if (toolKind !== 'execute') return null;
+
+  const paramsRecord = asRecord(rawParams);
+  let command =
+    (typeof paramsRecord?.command === 'string' ? paramsRecord.command : '') ||
+    (typeof getPathValue(toolCall, 'command') === 'string'
+      ? String(getPathValue(toolCall, 'command'))
+      : '') ||
+    '';
+  command = command.trim();
+
+  const argsValue = paramsRecord?.args ?? getPathValue(toolCall, 'args');
+  const args = Array.isArray(argsValue)
+    ? argsValue
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : [];
+
+  if (method === 'terminal/create' && command) {
+    return [command, ...args].join(' ').trim() || null;
+  }
+
+  // Fallback: ACP may flatten full shell command into `command` with no args.
+  if (command) return command;
+
+  return null;
 }
 
 function parsePermissionJson(value: unknown): unknown {

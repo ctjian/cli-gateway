@@ -28,7 +28,13 @@ import {
 } from '../db/jobStore.js';
 import { upsertDeliveryCheckpoint } from '../db/deliveryCheckpointStore.js';
 import { getUiMode, setUiMode } from '../db/uiPrefStore.js';
-import { ToolAuth, parseToolKind, TOOL_KINDS } from './toolAuth.js';
+import {
+  ToolAuth,
+  parseToolKind,
+  TOOL_KINDS,
+  type ToolAllowPrefixRule,
+  type PersistentToolPolicy,
+} from './toolAuth.js';
 import { BindingRuntime } from './bindingRuntime.js';
 import type { OutboundSink, UiMode } from './types.js';
 import { buildReplayContextFromRecentRuns } from './history.js';
@@ -81,6 +87,17 @@ const CLI_PRESETS: Record<CliPresetId, CliPreset> = {
   },
 };
 
+type RuntimeEntry = {
+  runtime: BindingRuntime;
+  lastUsedMs: number;
+  activePrompts: number;
+};
+
+type TrustSnapshot = {
+  allowPolicies: Array<{ toolKind: string; policy: PersistentToolPolicy }>;
+  allowPrefixes: ToolAllowPrefixRule[];
+};
+
 export class GatewayRouter {
   private readonly db: Db;
   private readonly config: AppConfig;
@@ -97,10 +114,8 @@ export class GatewayRouter {
     agentArgs: string[];
   }) => BindingRuntime;
 
-  private readonly runtimesBySessionKey = new Map<
-    string,
-    { runtime: BindingRuntime; lastUsedMs: number }
-  >();
+  private readonly runtimesBySessionKey = new Map<string, RuntimeEntry>();
+  private readonly trustSnapshots = new Map<string, TrustSnapshot>();
 
   private gcTimer: NodeJS.Timeout | null = null;
 
@@ -181,6 +196,7 @@ export class GatewayRouter {
     const existing = this.runtimesBySessionKey.get(params.sessionKey);
     if (existing) {
       existing.lastUsedMs = Date.now();
+      existing.activePrompts = existing.activePrompts ?? 0;
       return existing.runtime;
     }
 
@@ -219,6 +235,7 @@ export class GatewayRouter {
     this.runtimesBySessionKey.set(params.sessionKey, {
       runtime: rt,
       lastUsedMs: Date.now(),
+      activePrompts: 0,
     });
 
     this.enforceRuntimeLimit();
@@ -226,11 +243,30 @@ export class GatewayRouter {
     return rt;
   }
 
+  private touchRuntimeEntry(entry: RuntimeEntry): void {
+    entry.lastUsedMs = Date.now();
+  }
+
+  private markRuntimePromptStart(sessionKey: string, runtime: BindingRuntime): void {
+    const entry = this.runtimesBySessionKey.get(sessionKey);
+    if (!entry || entry.runtime !== runtime) return;
+    entry.activePrompts = (entry.activePrompts ?? 0) + 1;
+    this.touchRuntimeEntry(entry);
+  }
+
+  private markRuntimePromptEnd(sessionKey: string, runtime: BindingRuntime): void {
+    const entry = this.runtimesBySessionKey.get(sessionKey);
+    if (!entry || entry.runtime !== runtime) return;
+    entry.activePrompts = Math.max(0, (entry.activePrompts ?? 0) - 1);
+    this.touchRuntimeEntry(entry);
+  }
+
   private gc(): void {
     const now = Date.now();
     const ttlMs = this.config.runtimeIdleTtlSeconds * 1000;
 
     for (const [sessionKey, entry] of this.runtimesBySessionKey.entries()) {
+      if ((entry.activePrompts ?? 0) > 0) continue;
       if (now - entry.lastUsedMs <= ttlMs) continue;
       entry.runtime.close();
       this.runtimesBySessionKey.delete(sessionKey);
@@ -273,11 +309,13 @@ export class GatewayRouter {
       (a, b) => a[1].lastUsedMs - b[1].lastUsedMs,
     );
 
-    const removeCount = Math.max(0, entries.length - max);
-    for (let i = 0; i < removeCount; i += 1) {
-      const [sessionKey, entry] = entries[i];
+    let overflow = this.runtimesBySessionKey.size - max;
+    for (const [sessionKey, entry] of entries) {
+      if (overflow <= 0) break;
+      if ((entry.activePrompts ?? 0) > 0) continue;
       entry.runtime.close();
       this.runtimesBySessionKey.delete(sessionKey);
+      overflow -= 1;
     }
   }
 
@@ -285,7 +323,7 @@ export class GatewayRouter {
     platform: Platform;
     sessionKey: string;
     requestId: string;
-    decision: 'allow' | 'deny';
+    decision: 'allow' | 'allow_always' | 'allow_prefix' | 'deny';
     actorUserId: string;
   }): Promise<{ ok: boolean; message: string }> {
     // Permissions require a live runtime because the ACP agent is process-local.
@@ -830,6 +868,82 @@ export class GatewayRouter {
         return true;
       }
 
+      case '/trust': {
+        const { bindingKey } = this.ensureBindingExists(key);
+        const sub = String(parts[1] ?? '').trim().toLowerCase();
+
+        if (!sub || sub === 'show' || sub === 'status') {
+          const enabled = this.trustSnapshots.has(bindingKey);
+          await sink.sendText(
+            enabled
+              ? 'Trust mode: ON (temporary full-access override active)'
+              : 'Trust mode: OFF',
+          );
+          return true;
+        }
+
+        if (sub === 'on') {
+          if (!this.trustSnapshots.has(bindingKey)) {
+            const allowPolicies = this.toolAuth.listPersistentPolicies(
+              bindingKey,
+              'allow',
+            );
+            const allowPrefixes = this.toolAuth.listAllowPrefixRules(bindingKey);
+            this.trustSnapshots.set(bindingKey, {
+              allowPolicies,
+              allowPrefixes,
+            });
+          }
+
+          for (const kind of TOOL_KINDS) {
+            this.toolAuth.setPersistentPolicy(bindingKey, kind, 'allow');
+          }
+
+          await sink.sendText(
+            [
+              'OK: trust mode ON.',
+              'All tool kinds are temporarily allow-listed for this binding.',
+              'Run /trust off to restore previous whitelist snapshot.',
+            ].join('\n'),
+          );
+          return true;
+        }
+
+        if (sub === 'off') {
+          const snapshot = this.trustSnapshots.get(bindingKey);
+          if (!snapshot) {
+            await sink.sendText(
+              'Trust mode is not active (no snapshot to restore).',
+            );
+            return true;
+          }
+
+          this.toolAuth.clearPersistentPolicies(bindingKey);
+          this.toolAuth.clearAllowPrefixRules(bindingKey);
+
+          for (const row of snapshot.allowPolicies) {
+            const parsed = parseToolKind(row.toolKind);
+            if (!parsed) continue;
+            this.toolAuth.setPersistentPolicy(bindingKey, parsed, row.policy);
+          }
+
+          for (const rule of snapshot.allowPrefixes) {
+            this.toolAuth.setAllowPrefixRule(
+              bindingKey,
+              rule.toolKind,
+              rule.argPrefix,
+            );
+          }
+
+          this.trustSnapshots.delete(bindingKey);
+          await sink.sendText('OK: trust mode OFF. Previous whitelist restored.');
+          return true;
+        }
+
+        await sink.sendText('Usage: /trust on|off|status');
+        return true;
+      }
+
       case '/cron': {
         const sub = parts[1];
         const bindingKey = bindingKeyFromConversationKey(key);
@@ -1008,6 +1122,7 @@ export class GatewayRouter {
     try {
       const uiMode = getUiMode(this.db, bindingKey) ?? this.config.uiDefaultMode;
 
+      this.markRuntimePromptStart(sessionKey, rt);
       const result = await rt.prompt({
         runId,
         promptText: normalizedText || text,
@@ -1030,6 +1145,7 @@ export class GatewayRouter {
 
       await sink.sendText(`Error: ${String(error?.message ?? error)}`);
     } finally {
+      this.markRuntimePromptEnd(sessionKey, rt);
       try {
         await sink.flush?.();
       } catch (error) {
@@ -1305,6 +1421,7 @@ function whitelistUsageText(): string {
     '/whitelist add <tool_kind> [prefix]',
     '/whitelist del <tool_kind> [prefix]',
     '/whitelist clear',
+    '/trust on|off|status',
     '',
     'prefix rules:',
     '- read|edit|delete|move: absolute path prefix under current workspace',

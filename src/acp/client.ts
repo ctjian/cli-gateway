@@ -662,7 +662,21 @@ export class AcpClient {
 
     const byteLimit = params.outputByteLimit ?? 256_000;
 
-    const child = spawn(params.command, params.args ?? [], {
+    const rawCommand = String(params.command ?? '').trim();
+    let spawnCommand = rawCommand;
+    let spawnArgs = params.args ?? [];
+
+    // Be tolerant when callers pass a full shell command string in `command`
+    // without splitting args (for example: "ls -ld /root").
+    if (spawnCommand && spawnArgs.length === 0 && /\s/.test(spawnCommand)) {
+      spawnCommand = process.platform === 'win32' ? 'cmd.exe' : '/bin/bash';
+      spawnArgs =
+        process.platform === 'win32'
+          ? ['/d', '/s', '/c', rawCommand]
+          : ['-lc', rawCommand];
+    }
+
+    const child = spawn(spawnCommand, spawnArgs, {
       cwd,
       env: {
         ...process.env,
