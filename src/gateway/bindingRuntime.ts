@@ -181,7 +181,7 @@ export class BindingRuntime {
           this.pendingPermission = req;
           this.pendingPermissionActorUserId = this.currentActorUserId;
 
-          const toolKind = toToolKind(req.params.toolCall?.kind);
+          const toolKind = resolvePermissionToolKind(req.params.toolCall);
           if (toolKind) {
             const policy = this.toolAuth.evaluatePersistentPolicy(
               this.bindingKey,
@@ -361,7 +361,7 @@ export class BindingRuntime {
       return;
     }
 
-    const toolKind = toToolKind(pr.params.toolCall?.kind);
+    const toolKind = resolvePermissionToolKind(pr.params.toolCall);
     if (toolKind) {
       if (opt.kind === 'allow_always') {
         this.toolAuth.setPersistentPolicy(this.bindingKey, toolKind, 'allow');
@@ -406,7 +406,7 @@ export class BindingRuntime {
       return { ok: false, message: 'Not authorized.' };
     }
 
-    const toolKind = toToolKind(pr.params.toolCall?.kind);
+    const toolKind = resolvePermissionToolKind(pr.params.toolCall);
 
     const allowOnce = pr.params.options.find((o) => o.kind === 'allow_once');
     const allowAlways = pr.params.options.find((o) => o.kind === 'allow_always');
@@ -678,6 +678,24 @@ export class BindingRuntime {
 
 function toToolKind(kind: unknown): ToolKind | null {
   return parseToolKind(kind);
+}
+
+function resolvePermissionToolKind(toolCall: unknown): ToolKind | null {
+  const record = asRecord(toolCall);
+  const candidates: unknown[] = [
+    record?.kind,
+    record?.name,
+    record?.method,
+    record?.tool,
+    record?.title,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = toToolKind(candidate);
+    if (parsed) return parsed;
+  }
+
+  return null;
 }
 
 function formatPermissionRequest(req: PermissionRequest): string {
