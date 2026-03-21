@@ -33,6 +33,7 @@ export const TOOL_KINDS: ToolKind[] = [
 export function parseToolKind(value: unknown): ToolKind | null {
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
+  if (normalized === 'skill') return 'other';
   return TOOL_KINDS.includes(normalized as ToolKind)
     ? (normalized as ToolKind)
     : null;

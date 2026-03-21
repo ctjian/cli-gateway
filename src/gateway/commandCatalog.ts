@@ -10,7 +10,8 @@ export type BuiltinCommandName =
   | 'replay'
   | 'allow'
   | 'deny'
-  | 'whitelist';
+  | 'whitelist'
+  | 'trust';
 
 export type BuiltinCommandDefinition = {
   name: BuiltinCommandName;
@@ -78,6 +79,11 @@ const BUILTIN_COMMANDS: BuiltinCommandDefinition[] = [
     name: 'whitelist',
     description: '管理权限白名单',
     helpLine: '/whitelist list|add|del|clear - 管理权限白名单',
+  },
+  {
+    name: 'trust',
+    description: '临时开启或关闭信任模式',
+    helpLine: '/trust on|off|status - 临时切换信任模式',
   },
 ];
 
