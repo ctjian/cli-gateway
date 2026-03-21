@@ -673,6 +673,18 @@ function toToolKind(kind: unknown): ToolKind | null {
 
 function resolvePermissionToolKind(toolCall: unknown): ToolKind | null {
   const record = asRecord(toolCall);
+
+  const rawInputMethod =
+    typeof getPathValue(record, 'rawInput.method') === 'string'
+      ? String(getPathValue(record, 'rawInput.method')).trim()
+      : '';
+  const directMethod = typeof record?.method === 'string' ? record.method.trim() : '';
+
+  const mappedMethodKind =
+    mapPermissionMethodToToolKind(rawInputMethod) ??
+    mapPermissionMethodToToolKind(directMethod);
+  if (mappedMethodKind) return mappedMethodKind;
+
   const candidates: unknown[] = [
     record?.kind,
     record?.name,
@@ -682,9 +694,55 @@ function resolvePermissionToolKind(toolCall: unknown): ToolKind | null {
   ];
 
   for (const candidate of candidates) {
-    const parsed = toToolKind(candidate);
+    const parsed =
+      toToolKind(candidate) ??
+      (typeof candidate === 'string'
+        ? parsePermissionToolKindFromLabel(candidate)
+        : null);
     if (parsed) return parsed;
   }
+
+  return null;
+}
+
+function mapPermissionMethodToToolKind(method: string): ToolKind | null {
+  const normalized = method.trim().toLowerCase();
+  if (!normalized) return null;
+
+  if (normalized === 'fs/read_text_file') return 'read';
+  if (normalized === 'fs/write_text_file') return 'edit';
+  if (normalized.startsWith('fs/delete')) return 'delete';
+  if (normalized.startsWith('fs/move') || normalized.startsWith('fs/rename')) {
+    return 'move';
+  }
+  if (normalized === 'terminal/create' || normalized.startsWith('terminal/')) {
+    return 'execute';
+  }
+  if (normalized.startsWith('web/') || normalized.startsWith('browser/')) {
+    return 'fetch';
+  }
+
+  return null;
+}
+
+function parsePermissionToolKindFromLabel(label: string): ToolKind | null {
+  const normalized = label.trim().toLowerCase();
+  if (!normalized) return null;
+
+  const direct = toToolKind(normalized);
+  if (direct) return direct;
+
+  if (/^(write|edit|modify|update)\b/.test(normalized)) return 'edit';
+  if (/^(read|view)\b/.test(normalized)) return 'read';
+  if (/^(delete|remove|rm)\b/.test(normalized)) return 'delete';
+  if (/^(move|rename)\b/.test(normalized)) return 'move';
+  if (/^(run|execute|terminal\/create|terminal\/)\b/.test(normalized)) {
+    return 'execute';
+  }
+  if (/^(fetch|download|request|web\/|browser\/)\b/.test(normalized)) {
+    return 'fetch';
+  }
+  if (/^(search|find|grep)\b/.test(normalized)) return 'search';
 
   return null;
 }

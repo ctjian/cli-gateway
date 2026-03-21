@@ -384,6 +384,96 @@ test('decidePermission persists allow_always policy', async () => {
   rt.close();
 });
 
+test('decidePermission recognizes write file permission from rawInput method/title', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const key: ConversationKey = {
+    platform: 'discord',
+    chatId: 'c',
+    threadId: null,
+    userId: 'u',
+  };
+
+  createSession(db, {
+    sessionKey: 's1',
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: '/tmp',
+    loadSupported: false,
+  });
+  const bindingKey = upsertBinding(db, key, 's1').bindingKey;
+
+  const toolAuth = new ToolAuth(db);
+  const rt = new BindingRuntime({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot: '/tmp',
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'verbose',
+      uiJsonMaxChars: 1000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    toolAuth,
+    sessionKey: 's1',
+    bindingKey,
+    acpRpc: new NoopRpc(),
+    workspaceRoot: '/tmp',
+  });
+
+  (rt as any).pendingPermission = {
+    requestId: 6,
+    params: {
+      sessionId: 'sess',
+      toolCall: {
+        title: 'Write /data/code/refine-logs/round-2-review.md',
+        rawInput: {
+          method: 'fs/write_text_file',
+          params: {
+            path: '/data/code/refine-logs/round-2-review.md',
+          },
+        },
+      },
+      options: [{ optionId: 'a', name: 'Allow always', kind: 'allow_always' }],
+    },
+  };
+
+  const allowed = await rt.decidePermission({
+    decision: 'allow',
+    requestId: '6',
+  });
+  assert.equal(allowed.ok, true);
+  assert.equal(
+    toolAuth.getPersistentPolicy(bindingKey, 'edit'),
+    'allow',
+  );
+  assert.equal(
+    toolAuth.consume('s1', 'edit', {
+      method: 'fs/write_text_file',
+      params: { path: '/data/code/refine-logs/round-2-review.md' },
+      workspaceRoot: '/tmp',
+    }),
+    true,
+  );
+
+  rt.close();
+});
+
 test('decidePermission persists reject_always and can cancel if no option exists', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
@@ -854,7 +944,7 @@ test('buildToolUiEvent infers actionable titles and detail fields across branche
     title: 'Delete /tmp/file.txt',
     status: 'completed',
   });
-  assert.equal(sticky.title, 'run: npm test (+2 more) · completed');
+  assert.equal(sticky.title, 'delete: /tmp/file.txt · completed');
 
   const fromQuery = (rt as any).buildToolUiEvent({
     sessionUpdate: 'tool_call_update',
