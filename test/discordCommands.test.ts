@@ -37,6 +37,7 @@ test('buildDiscordSlashCommands includes base command names', () => {
     'new',
     'replay',
     'stop',
+    'trust',
     'ui',
     'whitelist',
     'workspace',

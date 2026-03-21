@@ -34,6 +34,7 @@ export function parseToolKind(value: unknown): ToolKind | null {
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
   if (normalized === 'skill') return 'other';
+  if (normalized === 'write') return 'edit';
   return TOOL_KINDS.includes(normalized as ToolKind)
     ? (normalized as ToolKind)
     : null;

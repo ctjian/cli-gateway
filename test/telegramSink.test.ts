@@ -21,6 +21,22 @@ function createFakeBot() {
   return { bot, calls };
 }
 
+function getInlineKeyboardData(call: any): {
+  allow: string;
+  allowAlways: string;
+  deny: string;
+} {
+  const inlineKeyboard = call?.args?.[2]?.reply_markup?.inline_keyboard;
+  assert.ok(Array.isArray(inlineKeyboard));
+  const row = inlineKeyboard[0];
+  assert.ok(Array.isArray(row));
+  return {
+    allow: String(row[0]?.callback_data ?? ''),
+    allowAlways: String(row[1]?.callback_data ?? ''),
+    deny: String(row[row.length - 1]?.callback_data ?? ''),
+  };
+}
+
 test('telegram sink renders permission with inline keyboard + HTML', async () => {
   const { bot, calls } = createFakeBot();
 
@@ -39,6 +55,36 @@ test('telegram sink renders permission with inline keyboard + HTML', async () =>
   assert.equal(call.args[0], 1);
   assert.equal(call.args[2].parse_mode, 'HTML');
   assert.ok(call.args[2].reply_markup);
+
+  const keyboard = getInlineKeyboardData(call);
+  assert.equal(keyboard.allow, 'acpperm:s:r:allow');
+  assert.equal(keyboard.allowAlways, 'acpperm:s:r:allow_prefix');
+  assert.equal(keyboard.deny, 'acpperm:s:r:deny');
+});
+
+test('telegram sink uses injected permission callback builder', async () => {
+  const { bot, calls } = createFakeBot();
+
+  const sink = createTelegramSink(bot, 'token', 1, null, 'u1', {
+    buildPermissionCallbackData: () => ({
+      allowData: 'acpperm:t:shorttoken:a',
+      denyData: 'acpperm:t:shorttoken:d',
+    }),
+  });
+
+  await sink.requestPermission!({
+    uiMode: 'summary',
+    sessionKey: 'session-very-long',
+    requestId: 'request-very-long',
+    toolTitle: 'terminal/create',
+    toolKind: 'execute',
+  });
+
+  const call = calls.find((c) => c.method === 'sendMessage');
+  assert.ok(call);
+  const keyboard = getInlineKeyboardData(call);
+  assert.equal(keyboard.allow, 'acpperm:t:shorttoken:a');
+  assert.equal(keyboard.deny, 'acpperm:t:shorttoken:d');
 });
 
 test('telegram sink renders UI events with HTML', async () => {
@@ -175,6 +221,11 @@ test('telegram group sink renders permission and UI', async () => {
   assert.ok(permission);
   assert.equal(permission.args[2].parse_mode, 'HTML');
   assert.ok(permission.args[2].reply_markup);
+
+  const keyboard = getInlineKeyboardData(permission);
+  assert.equal(keyboard.allow, 'acpperm:s:r:allow');
+  assert.equal(keyboard.allowAlways, 'acpperm:s:r:allow_prefix');
+  assert.equal(keyboard.deny, 'acpperm:s:r:deny');
 
   const ui = calls.at(-1);
   assert.equal(ui.method, 'sendMessage');

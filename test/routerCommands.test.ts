@@ -258,6 +258,72 @@ test('/whitelist list/add/del/clear manages allow policies per binding', async (
   router.close();
 });
 
+test('/trust on/off registers full allow snapshot and restores previous whitelist', async () => {
+  const db = createDb();
+  const router = new GatewayRouter({ db, config: createConfig() as any });
+
+  const key: ConversationKey = {
+    platform: 'discord',
+    chatId: 'trust-room',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const { sink, texts } = createSink();
+
+  await router.handleUserMessage(key, '/whitelist add read', sink as any);
+  await router.handleUserMessage(
+    key,
+    '/whitelist add execute npm test',
+    sink as any,
+  );
+
+  texts.length = 0;
+  await router.handleUserMessage(key, '/trust on', sink as any);
+  assert.ok(String(texts.at(-1)).includes('OK: trust mode ON.'));
+
+  const binding = db
+    .prepare(
+      'SELECT binding_key as bindingKey FROM bindings WHERE platform = ? AND chat_id = ? AND user_id = ? LIMIT 1',
+    )
+    .get('discord', 'trust-room', 'u') as { bindingKey: string };
+
+  const allowRows = db
+    .prepare(
+      'SELECT tool_kind as toolKind, policy FROM tool_policies WHERE binding_key = ? AND policy = ? ORDER BY tool_kind ASC',
+    )
+    .all(binding.bindingKey, 'allow') as Array<{ toolKind: string; policy: string }>;
+
+  assert.ok(allowRows.some((row) => row.toolKind === 'read'));
+  assert.ok(allowRows.some((row) => row.toolKind === 'edit'));
+  assert.ok(allowRows.some((row) => row.toolKind === 'other'));
+
+  texts.length = 0;
+  await router.handleUserMessage(key, '/trust off', sink as any);
+  assert.equal(texts.at(-1), 'OK: trust mode OFF. Previous whitelist restored.');
+
+  const restoredPolicies = db
+    .prepare(
+      'SELECT tool_kind as toolKind, policy FROM tool_policies WHERE binding_key = ? AND policy = ? ORDER BY tool_kind ASC',
+    )
+    .all(binding.bindingKey, 'allow') as Array<{ toolKind: string; policy: string }>;
+  assert.deepEqual(
+    restoredPolicies.map((row) => row.toolKind),
+    ['read'],
+  );
+
+  const restoredPrefixes = db
+    .prepare(
+      'SELECT tool_kind as toolKind, arg_prefix as argPrefix FROM tool_allow_prefixes WHERE binding_key = ? ORDER BY tool_kind ASC, arg_prefix ASC',
+    )
+    .all(binding.bindingKey) as Array<{ toolKind: string; argPrefix: string }>;
+  assert.deepEqual(restoredPrefixes, [
+    { toolKind: 'execute', argPrefix: 'npm test' },
+  ]);
+
+  router.close();
+});
+
 test('handlePermissionUi validates actor and dispatches to runtime', async () => {
   const db = createDb();
   const router = new GatewayRouter({ db, config: createConfig() as any });
@@ -288,6 +354,7 @@ test('handlePermissionUi validates actor and dispatches to runtime', async () =>
       close: () => {},
     },
     lastUsedMs: Date.now(),
+    activePrompts: 0,
   });
 
   const res = await router.handlePermissionUi({

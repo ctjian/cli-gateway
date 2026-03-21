@@ -87,6 +87,8 @@ test('ToolAuth consume supports once grants and persistent policy', () => {
 test('parseToolKind normalizes values and rejects unknown kinds', () => {
   assert.equal(parseToolKind('READ'), 'read');
   assert.equal(parseToolKind(' execute '), 'execute');
+  assert.equal(parseToolKind('skill'), 'other');
+  assert.equal(parseToolKind('write'), 'edit');
   assert.equal(parseToolKind('unknown_kind'), null);
   assert.equal(parseToolKind(null), null);
 });
