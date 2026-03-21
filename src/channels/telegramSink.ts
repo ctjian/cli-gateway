@@ -4,6 +4,8 @@ import type { OutboundSink } from '../gateway/router.js';
 import type { PermissionUiRequest, UiEvent } from '../gateway/types.js';
 import { createBufferedSink } from './bufferedSink.js';
 
+const TELEGRAM_TEXT_LIMIT = 4096;
+
 type ToolUiEvent = Extract<UiEvent, { kind: 'tool' }>;
 type TelegramPermissionCallbackData = {
   allowData: string;
@@ -95,14 +97,13 @@ export function createTelegramSink(
         const header = `<b>[${escapeHtml(event.kind)}]</b> ${escapeHtml(safeTitle)}`;
 
         if (event.detail && event.mode === 'verbose') {
-          const code = escapeHtml(truncate(event.detail, 3200));
-          await bot.api.sendMessage(
+          await sendTelegramHtmlCodeChunks(
+            bot,
             chatId,
-            `${header}\n\n<pre><code>${code}</code></pre>`,
-            {
-              message_thread_id: threadId ?? undefined,
-              parse_mode: 'HTML',
-            },
+            threadId,
+            header,
+            event.detail,
+            3200,
           );
           return;
         }
@@ -136,9 +137,7 @@ export function createTelegramSink(
     breakTextStream: agentBuffered.breakMessage,
     sendText: async (delta: string) => {
       if (!delta.trim()) return;
-      await bot.api.sendMessage(chatId, truncate(delta, 4096), {
-        message_thread_id: threadId ?? undefined,
-      });
+      await sendTelegramTextChunks(bot, chatId, threadId, delta);
     },
     flush: async () => {
       await agentBuffered.flush();
@@ -184,14 +183,13 @@ export function createTelegramSink(
       const header = `<b>[${escapeHtml(event.kind)}]</b> ${escapeHtml(safeTitle)}`;
 
       if (event.detail && event.mode === 'verbose') {
-        const code = escapeHtml(truncate(event.detail, 3200));
-        await bot.api.sendMessage(
+        await sendTelegramHtmlCodeChunks(
+          bot,
           chatId,
-          `${header}\n\n<pre><code>${code}</code></pre>`,
-          {
-            message_thread_id: threadId ?? undefined,
-            parse_mode: 'HTML',
-          },
+          threadId,
+          header,
+          event.detail,
+          3200,
         );
         return;
       }
@@ -257,6 +255,65 @@ function defaultTelegramPermissionCallbackData(
     allowAlwaysData: `acpperm:${req.sessionKey}:${req.requestId}:allow_prefix`,
     denyData: `acpperm:${req.sessionKey}:${req.requestId}:deny`,
   };
+}
+
+function splitTelegramMessageChunks(text: string, maxLen = TELEGRAM_TEXT_LIMIT): string[] {
+  const chunks: string[] = [];
+  let rest = String(text ?? '').trim();
+
+  while (rest.length > maxLen) {
+    let cut = rest.lastIndexOf('\n', maxLen);
+    if (cut <= 0) cut = maxLen;
+
+    const chunk = rest.slice(0, cut).trim();
+    if (chunk) chunks.push(chunk);
+
+    rest = rest.slice(cut).trim();
+  }
+
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
+async function sendTelegramTextChunks(
+  bot: Bot,
+  chatId: number,
+  threadId: number | null,
+  text: string,
+): Promise<void> {
+  const chunks = splitTelegramMessageChunks(text, TELEGRAM_TEXT_LIMIT);
+  for (const chunk of chunks) {
+    if (!chunk) continue;
+    await bot.api.sendMessage(chatId, chunk, {
+      message_thread_id: threadId ?? undefined,
+    });
+  }
+}
+
+async function sendTelegramHtmlCodeChunks(
+  bot: Bot,
+  chatId: number,
+  threadId: number | null,
+  headerHtml: string,
+  detailText: string,
+  bodyMaxLen = 3200,
+): Promise<void> {
+  const chunks = splitTelegramMessageChunks(detailText, bodyMaxLen);
+  if (!chunks.length) {
+    await bot.api.sendMessage(chatId, headerHtml, {
+      message_thread_id: threadId ?? undefined,
+      parse_mode: 'HTML',
+    });
+    return;
+  }
+
+  for (const chunk of chunks) {
+    const code = escapeHtml(chunk);
+    await bot.api.sendMessage(chatId, `${headerHtml}\n\n<pre><code>${code}</code></pre>`, {
+      message_thread_id: threadId ?? undefined,
+      parse_mode: 'HTML',
+    });
+  }
 }
 
 function truncate(text: string, maxLen: number): string {
