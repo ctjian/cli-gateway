@@ -5,6 +5,7 @@ import type { PermissionUiRequest, UiEvent } from '../gateway/types.js';
 import { createBufferedSink } from './bufferedSink.js';
 
 const TELEGRAM_TEXT_LIMIT = 4096;
+const TELEGRAM_SEND_RETRY_DELAY_MS = 250;
 
 type ToolUiEvent = Extract<UiEvent, { kind: 'tool' }>;
 type TelegramPermissionCallbackData = {
@@ -121,15 +122,11 @@ export function createTelegramSink(
     maxLen: 3800,
     flushIntervalMs: opts?.flushIntervalMs ?? 650,
     send: async (text) => {
-      const msg = await bot.api.sendMessage(chatId, text, {
-        message_thread_id: threadId ?? undefined,
-      });
+      const msg = await sendTelegramMessageWithRetry(bot, chatId, threadId, text);
       return { id: String(msg.message_id) };
     },
     edit: async (id, text) => {
-      await bot.api.editMessageText(chatId, Number(id), text, {
-        ...(threadId ? ({ message_thread_id: threadId } as any) : {}),
-      });
+      await editTelegramMessageWithRetry(bot, chatId, threadId, id, text);
     },
   });
   return {
@@ -284,9 +281,7 @@ async function sendTelegramTextChunks(
   const chunks = splitTelegramMessageChunks(text, TELEGRAM_TEXT_LIMIT);
   for (const chunk of chunks) {
     if (!chunk) continue;
-    await bot.api.sendMessage(chatId, chunk, {
-      message_thread_id: threadId ?? undefined,
-    });
+    await sendTelegramMessageWithRetry(bot, chatId, threadId, chunk);
   }
 }
 
@@ -300,8 +295,7 @@ async function sendTelegramHtmlCodeChunks(
 ): Promise<void> {
   const chunks = splitTelegramMessageChunks(detailText, bodyMaxLen);
   if (!chunks.length) {
-    await bot.api.sendMessage(chatId, headerHtml, {
-      message_thread_id: threadId ?? undefined,
+    await sendTelegramMessageWithRetry(bot, chatId, threadId, headerHtml, {
       parse_mode: 'HTML',
     });
     return;
@@ -309,11 +303,78 @@ async function sendTelegramHtmlCodeChunks(
 
   for (const chunk of chunks) {
     const code = escapeHtml(chunk);
-    await bot.api.sendMessage(chatId, `${headerHtml}\n\n<pre><code>${code}</code></pre>`, {
-      message_thread_id: threadId ?? undefined,
-      parse_mode: 'HTML',
-    });
+    await sendTelegramMessageWithRetry(
+      bot,
+      chatId,
+      threadId,
+      `${headerHtml}\n\n<pre><code>${code}</code></pre>`,
+      {
+        parse_mode: 'HTML',
+      },
+    );
   }
+}
+
+async function sendTelegramMessageWithRetry(
+  bot: Bot,
+  chatId: number,
+  threadId: number | null,
+  text: string,
+  extra?: Record<string, unknown>,
+): Promise<{ message_id: number }> {
+  const payload = {
+    message_thread_id: threadId ?? undefined,
+    ...(extra ?? {}),
+  };
+
+  try {
+    return await bot.api.sendMessage(chatId, text, payload as any);
+  } catch {
+    await sleep(TELEGRAM_SEND_RETRY_DELAY_MS);
+    return await bot.api.sendMessage(chatId, text, payload as any);
+  }
+}
+
+async function editTelegramMessageWithRetry(
+  bot: Bot,
+  chatId: number,
+  threadId: number | null,
+  messageId: string,
+  text: string,
+  extra?: Record<string, unknown>,
+): Promise<void> {
+  const payload = {
+    ...(threadId ? ({ message_thread_id: threadId } as any) : {}),
+    ...(extra ?? {}),
+  };
+
+  try {
+    await bot.api.editMessageText(chatId, Number(messageId), text, payload);
+  } catch (error) {
+    if (isNoopEditError(error)) return;
+    await sleep(TELEGRAM_SEND_RETRY_DELAY_MS);
+    await bot.api.editMessageText(chatId, Number(messageId), text, payload);
+  }
+}
+
+function isNoopEditError(error: unknown): boolean {
+  const message =
+    typeof error === 'string'
+      ? error
+      : error && typeof error === 'object' && 'message' in error
+        ? String((error as { message?: unknown }).message ?? '')
+        : '';
+  const lowered = message.toLowerCase();
+
+  return (
+    lowered.includes('message is not modified') ||
+    lowered.includes('message not modified') ||
+    lowered.includes('content must be different')
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function truncate(text: string, maxLen: number): string {

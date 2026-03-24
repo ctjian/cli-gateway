@@ -3,17 +3,30 @@ import assert from 'node:assert/strict';
 
 import { createTelegramSink } from '../src/channels/telegramSink.js';
 
-function createFakeBot() {
+function createFakeBot(opts?: {
+  failSendTimes?: number;
+  failEditTimes?: number;
+}) {
   const calls: any[] = [];
+  let remainingSendFailures = opts?.failSendTimes ?? 0;
+  let remainingEditFailures = opts?.failEditTimes ?? 0;
 
   const bot = {
     api: {
       sendMessage: async (...args: any[]) => {
         calls.push({ method: 'sendMessage', args });
+        if (remainingSendFailures > 0) {
+          remainingSendFailures -= 1;
+          throw new Error('temporary send failure');
+        }
         return { message_id: calls.length };
       },
       editMessageText: async (...args: any[]) => {
         calls.push({ method: 'editMessageText', args });
+        if (remainingEditFailures > 0) {
+          remainingEditFailures -= 1;
+          throw new Error('temporary edit failure');
+        }
       },
     },
   } as any;
@@ -134,6 +147,70 @@ test('telegram sink private chat edits message for incremental agent text', asyn
 
   assert.ok(calls.some((c) => c.method === 'sendMessage'));
   assert.ok(calls.some((c) => c.method === 'editMessageText'));
+});
+
+test('telegram sink private chat retries long-message send and still preserves continuation', async () => {
+  const { bot, calls } = createFakeBot({ failSendTimes: 1 });
+  const sink = createTelegramSink(bot, 'token', 1, null, 'u1');
+
+  const longText = 'A'.repeat(3800) + 'B'.repeat(50);
+  await sink.sendAgentText!(longText);
+  await sink.flush();
+
+  const sendCalls = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(sendCalls.length, 3);
+  assert.equal(String(sendCalls[0].args[1]).length, 3800);
+  assert.equal(String(sendCalls[1].args[1]).length, 3800);
+  assert.equal(String(sendCalls[2].args[1]).length, 50);
+
+  const state = sink.getDeliveryState?.();
+  assert.ok(state);
+  assert.equal(state?.text, 'B'.repeat(50));
+  assert.ok(state?.messageId);
+});
+
+test('telegram sink private chat retries transient edit failures', async () => {
+  const { bot, calls } = createFakeBot({ failEditTimes: 1 });
+  const sink = createTelegramSink(bot, 'token', 1, null, 'u1');
+
+  await sink.sendAgentText!('hello');
+  await sink.flush();
+  await sink.sendAgentText!(' world');
+  await sink.flush();
+
+  const editCalls = calls.filter((c) => c.method === 'editMessageText');
+  assert.equal(editCalls.length, 2);
+  assert.equal(String(editCalls.at(-1)?.args[2]), 'hello world');
+});
+
+test('telegram sink private chat retries continuation chunk send after transient failure', async () => {
+  const { bot, calls } = createFakeBot();
+  let sendCount = 0;
+  bot.api.sendMessage = async (...args: any[]) => {
+    calls.push({ method: 'sendMessage', args });
+    sendCount += 1;
+    if (sendCount === 2) {
+      throw new Error('temporary continuation failure');
+    }
+    return { message_id: calls.length };
+  };
+
+  const sink = createTelegramSink(bot, 'token', 1, null, 'u1');
+  const longText = 'A'.repeat(3800) + 'B'.repeat(50);
+
+  await sink.sendAgentText!(longText);
+  await sink.flush();
+
+  const sendCalls = calls.filter((c) => c.method === 'sendMessage');
+  assert.equal(sendCalls.length, 3);
+  assert.equal(String(sendCalls[0].args[1]).length, 3800);
+  assert.equal(String(sendCalls[1].args[1]).length, 50);
+  assert.equal(String(sendCalls[2].args[1]).length, 50);
+
+  const state = sink.getDeliveryState?.();
+  assert.ok(state);
+  assert.equal(state?.text, 'B'.repeat(50));
+  assert.ok(state?.messageId);
 });
 
 test('telegram sink private sendText uses standalone message path', async () => {
