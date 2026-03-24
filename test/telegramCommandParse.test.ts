@@ -7,7 +7,11 @@ import { migrate } from '../src/db/migrations.js';
 import { GatewayRouter } from '../src/gateway/router.js';
 import type { ConversationKey } from '../src/gateway/sessionStore.js';
 import {
+  createTelegramCommandSink,
+  parseTelegramPermissionCallbackData,
+  queueTelegramTextBurst,
   remapTelegramInlineCommand,
+  shouldDebounceTelegramTextBurst,
   splitTelegramMessageChunks,
   syncTelegramCommandsForChat,
 } from '../src/channels/telegram.js';
@@ -76,6 +80,33 @@ test('Telegram inline aliases remap to canonical slash commands', () => {
   );
 });
 
+test('Telegram permission callback parser accepts short token and legacy forms', () => {
+  assert.deepEqual(parseTelegramPermissionCallbackData('acpperm:t:shorttoken:a'), {
+    kind: 'token',
+    token: 'shorttoken',
+    decision: 'allow',
+  });
+  assert.deepEqual(parseTelegramPermissionCallbackData('acpperm:t:shorttoken:d'), {
+    kind: 'token',
+    token: 'shorttoken',
+    decision: 'deny',
+  });
+  assert.deepEqual(parseTelegramPermissionCallbackData('acpperm:s1:r1:allow'), {
+    kind: 'legacy',
+    sessionKey: 's1',
+    requestId: 'r1',
+    decision: 'allow',
+  });
+});
+
+test('Telegram permission callback parser rejects malformed data', () => {
+  assert.equal(parseTelegramPermissionCallbackData(''), null);
+  assert.equal(parseTelegramPermissionCallbackData('acpperm:t::a'), null);
+  assert.equal(parseTelegramPermissionCallbackData('acpperm:t:token:x'), null);
+  assert.equal(parseTelegramPermissionCallbackData('acpperm:s1:r1:x'), null);
+  assert.equal(parseTelegramPermissionCallbackData('hello:s1:r1:allow'), null);
+});
+
 test('Telegram command sync descriptions show canonical command name', async () => {
   const calls: Array<{ commands: any[]; scope: any }> = [];
   const bot = {
@@ -102,6 +133,49 @@ test('Telegram command sync descriptions show canonical command name', async () 
   assert.ok(String(dynamic.description).includes('cli-inline /research_lit -> /research-lit: 查找相关工作'));
 });
 
+test('Telegram command sink renders permission with inline keyboard + HTML', async () => {
+  const calls: any[] = [];
+  const bot = {
+    api: {
+      sendMessage: async (...args: any[]) => {
+        calls.push({ method: 'sendMessage', args });
+        return { message_id: calls.length };
+      },
+    },
+  } as any;
+
+  const sink = createTelegramCommandSink(
+    bot,
+    1,
+    null,
+    'u1',
+    () => ({
+      allowData: 'acpperm:t:shorttoken:a',
+      denyData: 'acpperm:t:shorttoken:d',
+    }),
+  );
+
+  await sink.requestPermission!({
+    uiMode: 'summary',
+    sessionKey: 'session-very-long',
+    requestId: 'request-very-long',
+    toolTitle: 'terminal/create',
+    toolKind: 'execute',
+  });
+
+  const call = calls.find((c) => c.method === 'sendMessage');
+  assert.ok(call);
+  assert.equal(call.args[0], 1);
+  assert.equal(call.args[2].parse_mode, 'HTML');
+
+  const inlineKeyboard = call.args[2]?.reply_markup?.inline_keyboard;
+  assert.ok(Array.isArray(inlineKeyboard));
+  const row = inlineKeyboard[0];
+  assert.ok(Array.isArray(row));
+  assert.equal(String(row[0]?.callback_data ?? ''), 'acpperm:t:shorttoken:a');
+  assert.equal(String(row[1]?.callback_data ?? ''), 'acpperm:t:shorttoken:d');
+});
+
 test('Telegram command replies split long help text into multiple messages', () => {
   const text = ['可用命令：', ...Array.from({ length: 300 }, (_, i) => `/cmd-${i}`)].join('\n');
   const chunks = splitTelegramMessageChunks(text, 120);
@@ -112,4 +186,75 @@ test('Telegram command replies split long help text into multiple messages', () 
     Array(chunks.length).fill(true),
   );
   assert.equal(chunks.join('\n'), text);
+});
+
+test('Telegram long plain text bursts are debounced, commands are not', () => {
+  assert.equal(
+    shouldDebounceTelegramTextBurst({
+      rawText: 'A'.repeat(3000),
+      resources: [],
+      isCommand: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldDebounceTelegramTextBurst({
+      rawText: 'short text',
+      resources: [],
+      isCommand: false,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldDebounceTelegramTextBurst({
+      rawText: '/help ' + 'A'.repeat(4000),
+      resources: [],
+      isCommand: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldDebounceTelegramTextBurst({
+      rawText: 'A'.repeat(3000),
+      resources: [{ uri: 'x' } as any],
+      isCommand: false,
+    }),
+    false,
+  );
+});
+
+test('Telegram long plain text burst queue merges nearby chunks into one dispatch', async () => {
+  const pending = new Map();
+  const flushed: any[] = [];
+
+  queueTelegramTextBurst({
+    pendingTextBursts: pending as any,
+    burstKey: 'chat:-:u',
+    chatId: 1,
+    chatType: 'private',
+    userId: 'u',
+    threadId: null,
+    rawText: 'A'.repeat(3200),
+    resources: [],
+    messageId: 1,
+    flush: (burst) => flushed.push(burst),
+  });
+  queueTelegramTextBurst({
+    pendingTextBursts: pending as any,
+    burstKey: 'chat:-:u',
+    chatId: 1,
+    chatType: 'private',
+    userId: 'u',
+    threadId: null,
+    rawText: 'B'.repeat(1200),
+    resources: [],
+    messageId: 2,
+    flush: (burst) => flushed.push(burst),
+  });
+
+  await new Promise((r) => setTimeout(r, 1300));
+
+  assert.equal(flushed.length, 1);
+  assert.deepEqual(flushed[0].texts, ['A'.repeat(3200), 'B'.repeat(1200)]);
+  assert.deepEqual(flushed[0].messageIds, [1, 2]);
 });

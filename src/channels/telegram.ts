@@ -33,6 +33,8 @@ export type TelegramController = {
 const TELEGRAM_PERMISSION_CALLBACK_PREFIX = 'acpperm';
 const TELEGRAM_PERMISSION_CALLBACK_TTL_MS = 30 * 60 * 1000;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 650;
+const TELEGRAM_TEXT_BURST_DEBOUNCE_MS = 1200;
+const TELEGRAM_TEXT_BURST_TRIGGER_LEN = 3000;
 const TELEGRAM_TYPING_INTERVAL_MS = 4000;
 const TELEGRAM_TEXT_LIMIT = 4096;
 
@@ -70,6 +72,18 @@ type PendingTelegramMediaGroup = {
   flushTimer: ReturnType<typeof setTimeout> | null;
 };
 
+type PendingTelegramTextBurst = {
+  chatId: number;
+  chatType: string;
+  userId: string;
+  fromId?: number;
+  threadId: string | null;
+  texts: string[];
+  resources: UserResource[];
+  messageIds: number[];
+  flushTimer: ReturnType<typeof setTimeout> | null;
+};
+
 export async function startTelegram(
   router: GatewayRouter,
   config: AppConfig,
@@ -82,6 +96,7 @@ export async function startTelegram(
   const bot = new Bot(config.telegramToken);
   const chatCommandSignatures = new Map<number, string>();
   const pendingMediaGroups = new Map<string, PendingTelegramMediaGroup>();
+  const pendingTextBursts = new Map<string, PendingTelegramTextBurst>();
   const pendingPermissions = new Map<string, PendingTelegramPermission>();
 
   const tgCommands = listTelegramBuiltinCommands();
@@ -209,17 +224,20 @@ export async function startTelegram(
       );
       const mediaGroupId = extractTelegramMediaGroupId(message);
 
+      const threadId = message.message_thread_id
+        ? String(message.message_thread_id)
+        : null;
+      const userId = String(ctx.from?.id ?? 'unknown');
+
       if (mediaGroupId) {
         queueTelegramMediaGroup({
           pendingMediaGroups,
           groupKey: `${ctx.chat.id}:${mediaGroupId}`,
           chatId: ctx.chat.id,
           chatType: ctx.chat.type,
-          userId: String(ctx.from?.id ?? 'unknown'),
+          userId,
           fromId: ctx.from?.id,
-          threadId: message.message_thread_id
-            ? String(message.message_thread_id)
-            : null,
+          threadId,
           mediaGroupId,
           rawText,
           resources,
@@ -246,6 +264,45 @@ export async function startTelegram(
       }
 
       if (!rawText.trim() && resources.length === 0) return;
+
+      if (
+        shouldDebounceTelegramTextBurst({
+          rawText,
+          resources,
+          isCommand: rawText.trim().startsWith('/'),
+        })
+      ) {
+        queueTelegramTextBurst({
+          pendingTextBursts,
+          burstKey: `${ctx.chat.id}:${threadId ?? '-'}:${userId}`,
+          chatId: ctx.chat.id,
+          chatType: ctx.chat.type,
+          userId,
+          fromId: ctx.from?.id,
+          threadId,
+          rawText,
+          resources,
+          messageId: Number(message.message_id),
+          flush: (burst) =>
+            dispatchTelegramInbound({
+              bot,
+              router,
+              config,
+              tgCommands,
+              chatCommandSignatures,
+              pendingPermissions,
+              chatId: burst.chatId,
+              chatType: burst.chatType,
+              userId: burst.userId,
+              fromId: burst.fromId,
+              threadId: burst.threadId,
+              rawText: mergeTelegramTexts(burst.texts),
+              resources: dedupeTelegramResources(burst.resources),
+            }),
+        });
+        return;
+      }
+
       dispatchTelegramInbound({
         bot,
         router,
@@ -255,11 +312,9 @@ export async function startTelegram(
         pendingPermissions,
         chatId: ctx.chat.id,
         chatType: ctx.chat.type,
-        userId: String(ctx.from?.id ?? 'unknown'),
+        userId,
         fromId: ctx.from?.id,
-        threadId: message.message_thread_id
-          ? String(message.message_thread_id)
-          : null,
+        threadId,
         rawText,
         resources,
       });
@@ -357,6 +412,87 @@ function queueTelegramMediaGroup(params: {
   }, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 
   pendingMediaGroups.set(groupKey, pending);
+}
+
+export function shouldDebounceTelegramTextBurst(params: {
+  rawText: string;
+  resources: UserResource[];
+  isCommand: boolean;
+}): boolean {
+  if (params.isCommand) return false;
+  if (params.resources.length > 0) return false;
+
+  const trimmed = params.rawText.trim();
+  if (!trimmed) return false;
+
+  return trimmed.length >= TELEGRAM_TEXT_BURST_TRIGGER_LEN;
+}
+
+export function queueTelegramTextBurst(params: {
+  pendingTextBursts: Map<string, PendingTelegramTextBurst>;
+  burstKey: string;
+  chatId: number;
+  chatType: string;
+  userId: string;
+  fromId?: number;
+  threadId: string | null;
+  rawText: string;
+  resources: UserResource[];
+  messageId: number;
+  flush: (burst: PendingTelegramTextBurst) => void;
+}): void {
+  const {
+    pendingTextBursts,
+    burstKey,
+    chatId,
+    chatType,
+    userId,
+    fromId,
+    threadId,
+    rawText,
+    resources,
+    messageId,
+    flush,
+  } = params;
+
+  const pending = pendingTextBursts.get(burstKey) ?? {
+    chatId,
+    chatType,
+    userId,
+    fromId,
+    threadId,
+    texts: [],
+    resources: [],
+    messageIds: [],
+    flushTimer: null,
+  };
+
+  if (rawText.trim()) {
+    pending.texts.push(rawText.trim());
+  }
+  if (resources.length > 0) {
+    pending.resources.push(...resources);
+  }
+  pending.messageIds.push(messageId);
+
+  if (pending.flushTimer) {
+    clearTimeout(pending.flushTimer);
+  }
+
+  pending.flushTimer = setTimeout(() => {
+    const current = pendingTextBursts.get(burstKey);
+    if (!current) return;
+
+    pendingTextBursts.delete(burstKey);
+    if (current.flushTimer) {
+      clearTimeout(current.flushTimer);
+      current.flushTimer = null;
+    }
+
+    flush(current);
+  }, TELEGRAM_TEXT_BURST_DEBOUNCE_MS);
+
+  pendingTextBursts.set(burstKey, pending);
 }
 
 function dispatchTelegramInbound(params: {
