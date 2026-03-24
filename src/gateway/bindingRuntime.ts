@@ -739,9 +739,10 @@ function parsePermissionToolKindFromLabel(label: string): ToolKind | null {
   if (/^(run|execute|terminal\/create|terminal\/)\b/.test(normalized)) {
     return 'execute';
   }
-  if (/^(fetch|download|request|web\/|browser\/)\b/.test(normalized)) {
+  if (/^(fetch|download|request|web\/|browser\/|site:)\b/.test(normalized)) {
     return 'fetch';
   }
+  if (/^https?:\/\//.test(normalized)) return 'fetch';
   if (/^(search|find|grep)\b/.test(normalized)) return 'search';
 
   return null;
