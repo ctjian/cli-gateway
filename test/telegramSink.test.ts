@@ -91,10 +91,12 @@ test('telegram sink uses injected permission callback builder', async () => {
     requestId: 'request-very-long',
     toolTitle: 'terminal/create',
     toolKind: 'execute',
+    debugHint: 'kind=execute | method=terminal/create',
   });
 
   const call = calls.find((c) => c.method === 'sendMessage');
   assert.ok(call);
+  assert.match(String(call.args[1]), /debug: kind=execute \| method=terminal\/create/);
   const keyboard = getInlineKeyboardData(call);
   assert.equal(keyboard.allow, 'acpperm:t:shorttoken:a');
   assert.equal(keyboard.deny, 'acpperm:t:shorttoken:d');

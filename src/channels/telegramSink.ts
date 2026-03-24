@@ -71,9 +71,12 @@ export function createTelegramSink(
         const reqShort = String(req.requestId ?? '').slice(0, 8) || 'unknown';
         const text = [
           `Permission: ${req.toolTitle}${toolKind}`,
+          req.debugHint ? `debug: ${req.debugHint}` : '',
           `request=${reqShort}`,
           `Only user ${userId} can approve.`,
-        ].join('\n');
+        ]
+          .filter(Boolean)
+          .join('\n');
 
         await bot.api.sendMessage(chatId, escapeHtml(text), {
           message_thread_id: threadId ?? undefined,
@@ -153,9 +156,12 @@ export function createTelegramSink(
       const reqShort = String(req.requestId ?? '').slice(0, 8) || 'unknown';
       const msgText = [
         `Permission: ${req.toolTitle}${toolKind}`,
+        req.debugHint ? `debug: ${req.debugHint}` : '',
         `request=${reqShort}`,
         `Only user ${userId} can approve.`,
-      ].join('\n');
+      ]
+        .filter(Boolean)
+        .join('\n');
 
       await bot.api.sendMessage(chatId, escapeHtml(msgText), {
         message_thread_id: threadId ?? undefined,

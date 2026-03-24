@@ -388,6 +388,165 @@ test('BindingRuntime auto-allow resolves tool kind from title fallback', async (
   db.close();
 });
 
+test('BindingRuntime auto-allow treats ready-to-code permission labels as other', async () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  migrate(db);
+
+  const workspaceRoot = fs.mkdtempSync('/tmp/cli-gateway-policy-ready-');
+
+  const key: ConversationKey = {
+    platform: 'telegram',
+    chatId: 'c-ready',
+    threadId: null,
+    userId: 'u',
+  };
+
+  const sessionKey = 's-ready';
+  createSession(db, {
+    sessionKey,
+    agentCommand: 'agent',
+    agentArgs: [],
+    cwd: workspaceRoot,
+    loadSupported: false,
+  });
+
+  const bindingKey = upsertBinding(db, key, sessionKey).bindingKey;
+  createRun(db, { runId: 'r-ready', sessionKey, promptText: 'go' });
+
+  const toolAuth = new ToolAuth(db);
+  toolAuth.setPersistentPolicy(bindingKey, 'other', 'allow');
+
+  class ReadyTitleRpc implements StdioProcess {
+    private messageHandlers: Array<(m: JsonRpcMessage) => void> = [];
+    private promptId: number | null = null;
+    private sessionId = 'sess-ready';
+
+    write(message: JsonRpcMessage): void {
+      if ('method' in message) {
+        const req = message as JsonRpcRequest;
+
+        if (req.method === 'initialize') {
+          queueMicrotask(() =>
+            this.emit({
+              jsonrpc: '2.0',
+              id: req.id,
+              result: { protocolVersion: 1, agentCapabilities: {} },
+            } as any),
+          );
+          return;
+        }
+
+        if (req.method === 'session/new') {
+          queueMicrotask(() =>
+            this.emit({
+              jsonrpc: '2.0',
+              id: req.id,
+              result: { sessionId: this.sessionId },
+            } as any),
+          );
+          return;
+        }
+
+        if (req.method === 'session/prompt') {
+          this.promptId = Number(req.id);
+          queueMicrotask(() => {
+            this.emit({
+              jsonrpc: '2.0',
+              id: 2499,
+              method: 'session/request_permission',
+              params: {
+                sessionId: this.sessionId,
+                toolCall: { title: 'Ready to code?' },
+                options: [
+                  { optionId: 'a1', name: 'Allow once', kind: 'allow_once' },
+                  { optionId: 'r1', name: 'Reject once', kind: 'reject_once' },
+                ],
+              },
+            } as any);
+          });
+        }
+        return;
+      }
+
+      if ('id' in message && 'result' in message) {
+        const res = message as JsonRpcResponse;
+        if (typeof res.id === 'number' && res.id === 2499) {
+          queueMicrotask(() => {
+            this.emit({
+              jsonrpc: '2.0',
+              id: this.promptId!,
+              result: { stopReason: 'end' },
+            } as any);
+          });
+        }
+      }
+    }
+
+    onMessage(cb: (message: JsonRpcMessage) => void): void {
+      this.messageHandlers.push(cb);
+    }
+
+    onStderr(): void {}
+    kill(): void {}
+
+    private emit(message: JsonRpcMessage): void {
+      this.messageHandlers.forEach((h) => h(message));
+    }
+  }
+
+  const rt = new BindingRuntime({
+    db,
+    config: {
+      discordToken: undefined,
+      discordAllowChannelId: undefined,
+      telegramToken: undefined,
+      feishuAppId: undefined,
+      feishuAppSecret: undefined,
+      feishuVerificationToken: undefined,
+      feishuListenPort: 3030,
+      acpAgentCommand: 'node',
+      acpAgentArgs: [],
+      workspaceRoot,
+      dbPath: ':memory:',
+      schedulerEnabled: false,
+      runtimeIdleTtlSeconds: 999,
+      maxBindingRuntimes: 5,
+      uiDefaultMode: 'summary',
+      uiJsonMaxChars: 1000,
+      contextReplayEnabled: false,
+      contextReplayRuns: 0,
+      contextReplayMaxChars: 0,
+    } as any,
+    toolAuth,
+    sessionKey,
+    bindingKey,
+    acpRpc: new ReadyTitleRpc(),
+    workspaceRoot,
+  });
+
+  const texts: string[] = [];
+  const sink: OutboundSink = {
+    sendText: async (t) => texts.push(t),
+    requestPermission: async () => {
+      throw new Error('should not ask');
+    },
+  };
+
+  const res = await rt.prompt({
+    runId: 'r-ready',
+    promptText: 'go',
+    sink,
+    uiMode: 'summary',
+  });
+
+  assert.equal(res.stopReason, 'end');
+  assert.equal(texts.length, 0);
+
+  rt.close();
+  db.close();
+});
+
 test('BindingRuntime auto-allow treats site-prefixed permission labels as fetch', async () => {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');

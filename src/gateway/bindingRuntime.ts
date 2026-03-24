@@ -245,6 +245,7 @@ export class BindingRuntime {
             title,
           );
           const toolArgs = resolvePermissionToolArgs(req.params.toolCall);
+          const debugHint = buildPermissionDebugHint(req.params.toolCall, toolKind, toolName);
 
           this.enqueueSinkWrite(async () => {
             const sink = this.activeSink;
@@ -259,6 +260,7 @@ export class BindingRuntime {
                 toolKind: toolKind ?? null,
                 toolName,
                 toolArgs,
+                debugHint,
               });
               return;
             }
@@ -744,8 +746,31 @@ function parsePermissionToolKindFromLabel(label: string): ToolKind | null {
   }
   if (/^https?:\/\//.test(normalized)) return 'fetch';
   if (/^(search|find|grep)\b/.test(normalized)) return 'search';
+  if (/^(skill|ready to code\??)\b/.test(normalized)) return 'other';
 
   return null;
+}
+
+function buildPermissionDebugHint(
+  toolCall: unknown,
+  toolKind: ToolKind | null,
+  toolName?: string,
+): string | undefined {
+  const record = asRecord(toolCall);
+  const parts: string[] = [];
+
+  if (toolKind) parts.push(`kind=${toolKind}`);
+  if (toolName) parts.push(`name=${toolName}`);
+
+  const method =
+    typeof record?.method === 'string'
+      ? record.method.trim()
+      : typeof getPathValue(record, 'rawInput.method') === 'string'
+        ? String(getPathValue(record, 'rawInput.method')).trim()
+        : '';
+  if (method) parts.push(`method=${method}`);
+
+  return parts.length > 0 ? parts.join(' | ') : undefined;
 }
 
 function formatPermissionRequest(req: PermissionRequest): string {
